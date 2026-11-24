@@ -320,8 +320,16 @@ fn validate_save_text(text: &str) -> Result<u32, String> {
             text.len()
         ));
     }
-    let mut line_count = 0usize;
-    for line in text.lines() {
+    let mut lines = text.lines();
+    let header = lines.next().ok_or_else(|| "empty save file".to_string())?;
+    let mut line_count = 1usize;
+    if header.len() > SAVE_MAX_LINE_BYTES {
+        return Err(format!(
+            "line 1: too long ({} bytes, max {SAVE_MAX_LINE_BYTES})",
+            header.len()
+        ));
+    }
+    for line in lines {
         line_count += 1;
         if line_count > SAVE_MAX_LINES {
             return Err(format!(
@@ -335,12 +343,7 @@ fn validate_save_text(text: &str) -> Result<u32, String> {
             ));
         }
     }
-    let header = text
-        .lines()
-        .next()
-        .ok_or_else(|| "empty save file".to_string())?
-        .trim();
-    parse_save_version(header)
+    parse_save_version(header.trim())
 }
 
 fn parse_save_version(header: &str) -> Result<u32, String> {
@@ -1067,8 +1070,18 @@ fn handle_save_keys(
     }
 
     if keys.just_pressed(bindings.load) {
-        match fs::read_to_string(SAVE_PATH)
+        match fs::metadata(SAVE_PATH)
             .map_err(|error| error.to_string())
+            .and_then(|meta| {
+                if meta.len() as usize > SAVE_MAX_BYTES {
+                    Err(format!(
+                        "save file too large ({} bytes, max {SAVE_MAX_BYTES})",
+                        meta.len()
+                    ))
+                } else {
+                    fs::read_to_string(SAVE_PATH).map_err(|error| error.to_string())
+                }
+            })
             .and_then(|text| load_save_text(&text))
         {
             Ok(data) => match data.restore_player(&mut pockets, &mut backpack, &mut progression) {

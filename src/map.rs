@@ -25,11 +25,10 @@ use crate::player::Player;
 use crate::ui::theme::{UiTheme, spawn_keycap, spawn_panel, spawn_text};
 use crate::ui_manager::{Overlay, UiManager};
 use crate::world::MapColumn;
-use crate::world::block::{Block, Shape};
-use crate::world::chunk::{
-    BLOCKS_PER_METRE, CHUNK_X, CHUNK_Y, CHUNK_Z, SEA_LEVEL_WORLD, detail_to_chunk,
-};
-use crate::world::generation::MapFloraKind;
+use crate::world::block::Block;
+use crate::world::block::{Shape, Voxel};
+use crate::world::chunk::{BLOCKS_PER_METRE, CHUNK_X, CHUNK_Y, CHUNK_Z, SEA_LEVEL_WORLD};
+use crate::world::generation::{MapFloraKind, TreeKind, VegetationSink, WorldGen, hash2};
 use crate::world::generation_data::BiomeId;
 use crate::world::{ChunkManager, WorldGenResource};
 
@@ -107,12 +106,6 @@ pub struct MapState {
     pub zoom: f32,
     pub dragging: bool,
     pub last_cursor: Option<Vec2>,
-    // perf/debug
-    pub perf_accum_terrain_ms: f32,
-    pub perf_accum_fog_ms: f32,
-    pub perf_accum_upload_ms: f32,
-    pub perf_frames: u32,
-    pub perf_timer: f32,
     pub last_fog_center: Vec2,
     pub last_fog_zoom: f32,
     pub last_fog_mode: Option<MapMode>,
@@ -125,18 +118,6 @@ pub struct MapState {
     pub buffer_valid: bool,
     pub raw_explore: Vec<u8>, // composited RGBA sent to GPU
     pub raw_terrain: Vec<u8>, // CPU-only: RGB terrain, A=255 explored, A=0 unexplored
-    /// Cached worldgen samples by block (x,z) for explored rendering.
-    pub sample_cache: HashMap<IVec2, MapColumn>,
-    pub flora_cache: HashMap<IVec2, MapFloraKind>,
-}
-
-/// Persistent explored-map data (Phase 2). Independent of loaded chunks.
-#[derive(Resource, Default)]
-pub struct MapExploration {
-    /// Explored cells in exploration-grid coordinates.
-    pub explored: HashSet<IVec2>,
-    /// Currently visible cells, recomputed periodically from player position.
-    pub visible: HashSet<IVec2>,
 }
 
 impl Default for MapState {
@@ -150,57 +131,755 @@ impl Default for MapState {
             target_open: false,
             open_amount: 0.0,
             center_xz: Vec2::ZERO,
-            zoom: DEFAULT_ZOOM,
+            zoom: 1.0,
             dragging: false,
             last_cursor: None,
-            perf_accum_terrain_ms: 0.0,
-            perf_accum_fog_ms: 0.0,
-            perf_accum_upload_ms: 0.0,
-            perf_frames: 0,
-            perf_timer: 0.0,
-            last_fog_center: Vec2::splat(f32::NAN),
-            last_fog_zoom: f32::NAN,
+            last_fog_center: Vec2::ZERO,
+            last_fog_zoom: 0.0,
             last_fog_mode: None,
             last_explored_len: 0,
             last_visible_signature: (IVec2::splat(i32::MIN), IVec2::splat(i32::MIN), 0),
-            last_fog_update: -1000.0,
-            buffer_center_xz: Vec2::splat(f32::NAN),
-            buffer_zoom: f32::NAN,
+            last_fog_update: 0.0,
+            buffer_center_xz: Vec2::ZERO,
+            buffer_zoom: 0.0,
             buffer_valid: false,
             raw_explore: Vec::new(),
             raw_terrain: Vec::new(),
-            sample_cache: HashMap::new(),
-            flora_cache: HashMap::new(),
         }
     }
 }
 
-pub struct MapPlugin;
+/// Persistent explored-map data (Phase 2). Independent of loaded chunks.
+#[derive(Resource, Default)]
+pub struct MapExploration {
+    /// Explored cells in exploration-grid coordinates.
+    pub explored: HashSet<IVec2>,
+    /// Currently visible cells, recomputed periodically from player position.
+    pub visible: HashSet<IVec2>,
+}
 
-impl Plugin for MapPlugin {
-    fn build(&self, app: &mut App) {
-        app.init_resource::<MapState>()
-            .init_resource::<MapExploration>()
-            .add_systems(
-                Update,
-                (
-                    sync_map_target,
-                    animate_map_transition,
-                    handle_map_drag,
-                    handle_map_zoom,
-                    update_map_mode,
-                    update_map_exploration,
-                    update_fog_image,
-                    update_map_camera,
-                    update_map_ui,
-                    style_map_mode_tabs,
-                )
-                    .chain()
-                    .in_set(MapSystems),
-            );
-        app.add_observer(on_map_mode_tab_activate);
-        app.add_systems(Startup, (setup_map_render_target, setup_map_ui).chain());
+const MAP_CHUNK_COLS: usize =
+    (CHUNK_X / BLOCKS_PER_METRE as usize) * (CHUNK_Z / BLOCKS_PER_METRE as usize);
+/// Flora coverage raster resolution per 16m map chunk (64x64 = 0.25m/cell).
+const MAP_FLORA_RASTER: usize = 64;
+const MAP_FLORA_CELLS: usize = MAP_FLORA_RASTER * MAP_FLORA_RASTER;
+const MAP_FLORA_MIP1: usize = 32;
+const MAP_FLORA_MIP1_CELLS: usize = MAP_FLORA_MIP1 * MAP_FLORA_MIP1;
+const MAP_FLORA_MIP2: usize = 16;
+const MAP_FLORA_MIP2_CELLS: usize = MAP_FLORA_MIP2 * MAP_FLORA_MIP2;
+const MAP_FLORA_MIP3: usize = 8;
+const MAP_FLORA_MIP3_CELLS: usize = MAP_FLORA_MIP3 * MAP_FLORA_MIP3;
+/// Reduced from 4096 to limit memory with 64x64 flora planes+mips.
+const MAP_CACHE_MAX_ENTRIES: usize = 2048;
+const MAP_CACHE_PRUNE_MARGIN_CHUNKS: i32 = 4;
+
+#[derive(Clone, Copy)]
+struct MapSnapshotColumn {
+    col: MapColumn,
+    rgba: [u8; 4],
+}
+
+/// Separate tree and bush coverage planes. Coverage is 0..=255.
+/// Meta packs compact visual info: low 3 bits species/variant, high 2 bits height bucket.
+#[derive(Clone)]
+struct MapChunkSnapshot {
+    columns: [MapSnapshotColumn; MAP_CHUNK_COLS],
+    tree_cov: [u8; MAP_FLORA_CELLS],
+    bush_cov: [u8; MAP_FLORA_CELLS],
+    tree_meta: [u8; MAP_FLORA_CELLS],
+    bush_meta: [u8; MAP_FLORA_CELLS],
+    tree_mip1: [u8; MAP_FLORA_MIP1_CELLS],
+    tree_mip2: [u8; MAP_FLORA_MIP2_CELLS],
+    tree_mip3: [u8; MAP_FLORA_MIP3_CELLS],
+    bush_mip1: [u8; MAP_FLORA_MIP1_CELLS],
+    bush_mip2: [u8; MAP_FLORA_MIP2_CELLS],
+    bush_mip3: [u8; MAP_FLORA_MIP3_CELLS],
+    has_flora: bool,
+    terrain_dirty: bool,
+    flora_dirty: bool,
+    last_used: u64,
+}
+
+impl MapChunkSnapshot {
+    fn new() -> Self {
+        Self {
+            columns: [MapSnapshotColumn {
+                col: MapColumn {
+                    height: SEA_LEVEL_WORLD,
+                    surface: Block::Air,
+                    has_turf: false,
+                    has_snow: false,
+                    biome: BiomeId::Plains,
+                    forest: 0.0,
+                    supports_flora: false,
+                    flora: MapFloraKind::None,
+                },
+                rgba: [0, 0, 0, 0],
+            }; MAP_CHUNK_COLS],
+            tree_cov: [0u8; MAP_FLORA_CELLS],
+            bush_cov: [0u8; MAP_FLORA_CELLS],
+            tree_meta: [0u8; MAP_FLORA_CELLS],
+            bush_meta: [0u8; MAP_FLORA_CELLS],
+            tree_mip1: [0u8; MAP_FLORA_MIP1_CELLS],
+            tree_mip2: [0u8; MAP_FLORA_MIP2_CELLS],
+            tree_mip3: [0u8; MAP_FLORA_MIP3_CELLS],
+            bush_mip1: [0u8; MAP_FLORA_MIP1_CELLS],
+            bush_mip2: [0u8; MAP_FLORA_MIP2_CELLS],
+            bush_mip3: [0u8; MAP_FLORA_MIP3_CELLS],
+            has_flora: false,
+            terrain_dirty: true,
+            flora_dirty: true,
+            last_used: 0,
+        }
     }
+}
+
+const MAP_SNAPSHOT_BUILD_BUDGET_MS: f32 = 2.0;
+
+#[derive(Resource, Default)]
+pub struct MapTerrainCache {
+    chunks: HashMap<IVec2, MapChunkSnapshot>,
+    frame: u64,
+    hits: u64,
+    misses: u64,
+    builds: u64,
+    build_ms: f32,
+    flora_build_ms: f32,
+    flora_mip_ms: f32,
+    builds_this_frame: u32,
+    build_ms_this_frame: f32,
+    queue_len: usize,
+}
+
+impl MapTerrainCache {
+    fn touch_frame(&mut self) {
+        self.frame = self.frame.wrapping_add(1);
+        self.builds_this_frame = 0;
+        self.build_ms_this_frame = 0.0;
+    }
+    fn prune(&mut self, center: IVec2, keep_radius_chunks: i32) {
+        self.chunks.retain(|k, _| {
+            (k.x - center.x).abs() <= keep_radius_chunks
+                && (k.y - center.y).abs() <= keep_radius_chunks
+        });
+        if self.chunks.len() <= MAP_CACHE_MAX_ENTRIES {
+            return;
+        }
+        let mut keys: Vec<(u64, IVec2)> =
+            self.chunks.iter().map(|(k, v)| (v.last_used, *k)).collect();
+        keys.sort_by_key(|(u, _)| *u);
+        let remove = self.chunks.len().saturating_sub(MAP_CACHE_MAX_ENTRIES);
+        for (_, k) in keys.into_iter().take(remove) {
+            self.chunks.remove(&k);
+        }
+    }
+}
+
+fn snapshot_index(lx: usize, lz: usize) -> usize {
+    lz * (CHUNK_X / BLOCKS_PER_METRE as usize) + lx
+}
+
+#[inline]
+fn flora_raster_index(lx: usize, lz: usize) -> usize {
+    lz * MAP_FLORA_RASTER + lx
+}
+
+#[inline]
+fn build_flora_mips(
+    src: &[u8; MAP_FLORA_CELLS],
+    m1: &mut [u8; MAP_FLORA_MIP1_CELLS],
+    m2: &mut [u8; MAP_FLORA_MIP2_CELLS],
+    m3: &mut [u8; MAP_FLORA_MIP3_CELLS],
+) {
+    for z in 0..MAP_FLORA_MIP1 {
+        for x in 0..MAP_FLORA_MIP1 {
+            let mut sum = 0u16;
+            for dz in 0..2 {
+                for dx in 0..2 {
+                    sum += src[(z * 2 + dz) * MAP_FLORA_RASTER + (x * 2 + dx)] as u16;
+                }
+            }
+            m1[z * MAP_FLORA_MIP1 + x] = (sum / 4) as u8;
+        }
+    }
+    for z in 0..MAP_FLORA_MIP2 {
+        for x in 0..MAP_FLORA_MIP2 {
+            let mut sum = 0u16;
+            for dz in 0..2 {
+                for dx in 0..2 {
+                    sum += m1[(z * 2 + dz) * MAP_FLORA_MIP1 + (x * 2 + dx)] as u16;
+                }
+            }
+            m2[z * MAP_FLORA_MIP2 + x] = (sum / 4) as u8;
+        }
+    }
+    for z in 0..MAP_FLORA_MIP3 {
+        for x in 0..MAP_FLORA_MIP3 {
+            let mut sum = 0u16;
+            for dz in 0..2 {
+                for dx in 0..2 {
+                    sum += m2[(z * 2 + dz) * MAP_FLORA_MIP2 + (x * 2 + dx)] as u16;
+                }
+            }
+            m3[z * MAP_FLORA_MIP3 + x] = (sum / 4) as u8;
+        }
+    }
+}
+
+#[derive(Clone)]
+struct MapCanopySink {
+    tree_cov: [u8; MAP_FLORA_CELLS],
+    bush_cov: [u8; MAP_FLORA_CELLS],
+    tree_meta: [u8; MAP_FLORA_CELLS],
+    bush_meta: [u8; MAP_FLORA_CELLS],
+    occupied: HashSet<IVec3>,
+    y_min: i32,
+    y_max: i32,
+}
+
+impl MapCanopySink {
+    fn new(_coord_xz: IVec2, y_min: i32, y_max: i32) -> Self {
+        Self {
+            tree_cov: [0u8; MAP_FLORA_CELLS],
+            bush_cov: [0u8; MAP_FLORA_CELLS],
+            tree_meta: [0u8; MAP_FLORA_CELLS],
+            bush_meta: [0u8; MAP_FLORA_CELLS],
+            occupied: HashSet::new(),
+            y_min,
+            y_max,
+        }
+    }
+    #[inline]
+    fn local_to_raster(&self, x: i32, z: i32) -> Option<(usize, usize)> {
+        // detail local in 16m chunk: 0..32 corresponds to world 0..16m. Map to MAP_FLORA_RASTER.
+        let scale = MAP_FLORA_RASTER as f32 / CHUNK_X as f32;
+        let fx = ((x as f32) * scale).floor() as isize;
+        let fz = ((z as f32) * scale).floor() as isize;
+        if fx < 0 || fz < 0 || fx >= MAP_FLORA_RASTER as isize || fz >= MAP_FLORA_RASTER as isize {
+            return None;
+        }
+        Some((fx as usize, fz as usize))
+    }
+    fn record_voxel(&mut self, x: i32, _y: i32, z: i32, voxel: Voxel) {
+        let Some((fx, fz)) = self.local_to_raster(x, z) else {
+            return;
+        };
+        let shape = voxel.shape();
+        let block = voxel.block();
+        let i = flora_raster_index(fx, fz);
+        if block == Block::Leaves || matches!(shape, Shape::Foliage) {
+            self.tree_cov[i] = self.tree_cov[i].saturating_add(32);
+            self.tree_meta[i] = 1;
+        } else if matches!(shape, Shape::SmallFoliage) {
+            self.bush_cov[i] = self.bush_cov[i].saturating_add(40);
+            self.bush_meta[i] = 1;
+        } else if matches!(shape, Shape::Trunk | Shape::DebarkedTrunk) {
+            self.tree_cov[i] = self.tree_cov[i].saturating_add(12);
+            if self.tree_meta[i] == 0 {
+                self.tree_meta[i] = 1;
+            }
+        }
+    }
+}
+
+impl VegetationSink for MapCanopySink {
+    fn veg_get(&self, x: i32, y: i32, z: i32) -> Voxel {
+        if x < 0
+            || z < 0
+            || x >= CHUNK_X as i32
+            || z >= CHUNK_Z as i32
+            || y < self.y_min
+            || y > self.y_max
+        {
+            return Voxel::AIR;
+        }
+        if self.occupied.contains(&IVec3::new(x, y, z)) {
+            // Return a non-air placeholder so placement_if_air respects occupancy.
+            Voxel::new(Block::Leaves)
+        } else {
+            Voxel::AIR
+        }
+    }
+    fn veg_set_if_air(&mut self, x: i32, y: i32, z: i32, voxel: Voxel) {
+        if x < 0
+            || z < 0
+            || x >= CHUNK_X as i32
+            || z >= CHUNK_Z as i32
+            || y < self.y_min
+            || y > self.y_max
+        {
+            return;
+        }
+        let p = IVec3::new(x, y, z);
+        if self.occupied.insert(p) {
+            self.record_voxel(x, y, z, voxel);
+        }
+    }
+}
+
+fn rasterize_tree_plan_into_sink(
+    wg: &WorldGen,
+    sink: &mut MapCanopySink,
+    seed: u32,
+    world_x: i32,
+    world_z: i32,
+    column: &MapColumn,
+) {
+    let Some((trunk_h, species)) = wg.tree_plan_at(world_x, world_z) else {
+        return;
+    };
+    if !wg.tree_has_spacing(world_x, world_z, trunk_h) {
+        return;
+    }
+    let scale = BLOCKS_PER_METRE as i32;
+    let lx = world_x.rem_euclid(CHUNK_X as i32 / scale) * scale;
+    let lz = world_z.rem_euclid(CHUNK_Z as i32 / scale) * scale;
+    let base = (column.height + 1) * scale;
+    let roll = hash2(seed ^ 0x51ed_270b, world_x, world_z);
+    let trunk_storage = IVec3::new(lx, base, lz);
+    match species.kind {
+        TreeKind::BroadleafOak => {
+            WorldGen::place_broadleaf_oak(sink, seed, trunk_storage, trunk_h, roll)
+        }
+        TreeKind::Birch => WorldGen::place_birch(sink, seed, trunk_storage, trunk_h, roll),
+        TreeKind::Pine => WorldGen::place_pine(sink, seed, trunk_storage, trunk_h, roll),
+        TreeKind::Spruce => WorldGen::place_spruce(sink, seed, trunk_storage, trunk_h, roll),
+        TreeKind::HardyShrubTree => {
+            WorldGen::place_hardy_shrub_tree(sink, seed, trunk_storage, trunk_h, roll)
+        }
+    }
+    let _ = (wg, world_x, world_z);
+}
+
+fn rasterize_bush_plan_into_sink(
+    wg: &WorldGen,
+    sink: &mut MapCanopySink,
+    seed: u32,
+    world_x: i32,
+    world_z: i32,
+    column: &MapColumn,
+) {
+    let Some((roll, kind)) = wg.bush_plan_at(world_x, world_z) else {
+        return;
+    };
+    let scale = BLOCKS_PER_METRE as i32;
+    let lx = world_x.rem_euclid(CHUNK_X as i32 / scale) * scale;
+    let lz = world_z.rem_euclid(CHUNK_Z as i32 / scale) * scale;
+    let base = (column.height + 1) * scale;
+    WorldGen::place_bush_variant(sink, seed, IVec3::new(lx, base, lz), roll, kind);
+    let _ = column;
+}
+
+fn biome_base_color(col: MapColumn) -> [f32; 3] {
+    if col.height < SEA_LEVEL_WORLD || col.surface.is_water() {
+        let depth = (SEA_LEVEL_WORLD - col.height).max(0) as f32;
+        let t = (depth / 18.0).clamp(0.0, 1.0);
+        let shallow = [76.0, 148.0, 176.0];
+        let deep = [24.0, 58.0, 110.0];
+        return [
+            shallow[0] + (deep[0] - shallow[0]) * t,
+            shallow[1] + (deep[1] - shallow[1]) * t,
+            shallow[2] + (deep[2] - shallow[2]) * t,
+        ];
+    }
+    let shore = (col.height - SEA_LEVEL_WORLD) as f32;
+    if shore <= 1.5 && matches!(col.surface, Block::Sand | Block::RedSandstone) {
+        return [194.0, 178.0, 132.0];
+    }
+    match col.biome {
+        BiomeId::Desert => [198.0, 168.0, 112.0],
+        BiomeId::Mesa => [176.0, 118.0, 86.0],
+        BiomeId::Alpine => {
+            if col.has_snow {
+                [214.0, 220.0, 228.0]
+            } else {
+                [142.0, 136.0, 128.0]
+            }
+        }
+        BiomeId::Plains => {
+            if col.has_turf {
+                [108.0, 150.0, 78.0]
+            } else {
+                [140.0, 128.0, 96.0]
+            }
+        }
+        BiomeId::Forest => {
+            if col.has_turf {
+                [72.0, 114.0, 62.0]
+            } else {
+                [98.0, 90.0, 72.0]
+            }
+        }
+    }
+}
+
+fn sample_snapshot_column(
+    generator: &WorldGenResource,
+    manager: &ChunkManager,
+    wx: i32,
+    wz: i32,
+) -> MapColumn {
+    let mut col = generator.0.map_column_at(wx, wz);
+    let mut edited_height = col.height;
+    let mut edited_surface = col.surface;
+    let mut edited_turf = col.has_turf;
+    let mut edited_snow = col.has_snow;
+    let mut found_world_edit = false;
+    for y in (SEA_LEVEL_WORLD - 32..=SEA_LEVEL_WORLD + 128).rev() {
+        let p = IVec3::new(wx, y, wz);
+        if let Some(&b) = manager.world_edits.get(&p) {
+            edited_height = y;
+            edited_surface = b;
+            found_world_edit = true;
+            edited_turf = manager.turf_edits.get(&p).copied().unwrap_or(false);
+            edited_snow = manager.snow_edits.get(&p).copied().unwrap_or(false);
+            break;
+        }
+    }
+    if found_world_edit {
+        col.height = edited_height;
+        col.surface = edited_surface;
+        col.has_turf = edited_turf;
+        col.has_snow = edited_snow;
+        col.supports_flora =
+            edited_surface.is_solid() && !edited_surface.is_water() && !edited_snow;
+    } else {
+        let surf_p = IVec3::new(wx, col.height, wz);
+        if let Some(&t) = manager.turf_edits.get(&surf_p) {
+            col.has_turf = t;
+        }
+        if let Some(&s) = manager.snow_edits.get(&surf_p) {
+            col.has_snow = s;
+            col.supports_flora = col.surface.is_solid() && !col.surface.is_water() && !col.has_snow;
+        }
+    }
+    col
+}
+
+fn terrain_rgba_from_column(
+    col: MapColumn,
+    h_l: i32,
+    h_r: i32,
+    h_u: i32,
+    h_d: i32,
+    wx: i32,
+    wz: i32,
+) -> [u8; 4] {
+    let mut rgb = biome_base_color(col);
+    let elev = (col.height - SEA_LEVEL_WORLD) as f32;
+    let elev_t = (elev / 80.0).clamp(-0.5, 1.0);
+    let elev_factor = 1.0 + elev_t * 0.18;
+    rgb[0] *= elev_factor;
+    rgb[1] *= elev_factor;
+    rgb[2] *= elev_factor;
+    let shade = ((h_r - h_l) as f32 * -0.08 + (h_d - h_u) as f32 * -0.08).clamp(-0.35, 0.35);
+    let hill = 1.0 + shade;
+    rgb[0] *= hill;
+    rgb[1] *= hill;
+    rgb[2] *= hill;
+    if col.height >= SEA_LEVEL_WORLD && col.supports_flora {
+        let n = hash01(wx, wz, 0x0A11_CE55);
+        if col.biome == BiomeId::Forest {
+            let canopy = (col.forest * 0.7 + n * 0.3).clamp(0.0, 1.0);
+            let dark = 0.75 + (1.0 - canopy) * 0.25;
+            rgb[0] *= dark * 0.92;
+            rgb[1] *= dark;
+            rgb[2] *= dark * 0.90;
+            if n > 0.82 {
+                rgb[0] *= 0.88;
+                rgb[1] *= 0.92;
+                rgb[2] *= 0.86;
+            }
+        } else if col.biome == BiomeId::Plains && col.has_turf {
+            let g = 0.95 + n * 0.1;
+            rgb[0] *= 0.97;
+            rgb[1] *= g;
+            rgb[2] *= 0.95;
+        } else if col.biome == BiomeId::Desert {
+            let d = 0.95 + n * 0.08;
+            rgb[0] *= d;
+            rgb[1] *= 0.96 + n * 0.05;
+            rgb[2] *= 0.93;
+        }
+    }
+    if col.height >= SEA_LEVEL_WORLD
+        && col.height <= SEA_LEVEL_WORLD + 1
+        && matches!(col.surface, Block::Sand | Block::RedSandstone)
+    {
+        rgb[0] = rgb[0] * 0.85 + 210.0 * 0.15;
+        rgb[1] = rgb[1] * 0.85 + 196.0 * 0.15;
+        rgb[2] = rgb[2] * 0.85 + 150.0 * 0.15;
+    }
+    [
+        rgb[0].clamp(0.0, 255.0) as u8,
+        rgb[1].clamp(0.0, 255.0) as u8,
+        rgb[2].clamp(0.0, 255.0) as u8,
+        255,
+    ]
+}
+
+fn build_snapshot_terrain(
+    cache: &mut MapTerrainCache,
+    generator: &WorldGenResource,
+    manager: &ChunkManager,
+    coord_xz: IVec2,
+) {
+    let frame = cache.frame;
+    let t0 = std::time::Instant::now();
+    let mut snap = cache
+        .chunks
+        .remove(&coord_xz)
+        .unwrap_or_else(MapChunkSnapshot::new);
+    snap.last_used = frame;
+    let cols_per_side = CHUNK_X / BLOCKS_PER_METRE as usize;
+    let mut cols = [MapColumn {
+        height: SEA_LEVEL_WORLD,
+        surface: Block::Air,
+        has_turf: false,
+        has_snow: false,
+        biome: BiomeId::Plains,
+        forest: 0.0,
+        supports_flora: false,
+        flora: MapFloraKind::None,
+    }; MAP_CHUNK_COLS];
+    for lz in 0..cols_per_side {
+        for lx in 0..cols_per_side {
+            let wx = coord_xz.x * cols_per_side as i32 + lx as i32;
+            let wz = coord_xz.y * cols_per_side as i32 + lz as i32;
+            cols[snapshot_index(lx, lz)] = sample_snapshot_column(generator, manager, wx, wz);
+        }
+    }
+    for lz in 0..cols_per_side {
+        for lx in 0..cols_per_side {
+            let wx = coord_xz.x * cols_per_side as i32 + lx as i32;
+            let wz = coord_xz.y * cols_per_side as i32 + lz as i32;
+            let col = cols[snapshot_index(lx, lz)];
+            let h_l = if lx > 0 {
+                cols[snapshot_index(lx - 1, lz)].height
+            } else {
+                sample_snapshot_column(generator, manager, wx - 1, wz).height
+            };
+            let h_r = if lx + 1 < cols_per_side {
+                cols[snapshot_index(lx + 1, lz)].height
+            } else {
+                sample_snapshot_column(generator, manager, wx + 1, wz).height
+            };
+            let h_u = if lz > 0 {
+                cols[snapshot_index(lx, lz - 1)].height
+            } else {
+                sample_snapshot_column(generator, manager, wx, wz - 1).height
+            };
+            let h_d = if lz + 1 < cols_per_side {
+                cols[snapshot_index(lx, lz + 1)].height
+            } else {
+                sample_snapshot_column(generator, manager, wx, wz + 1).height
+            };
+            let rgba = terrain_rgba_from_column(col, h_l, h_r, h_u, h_d, wx, wz);
+            snap.columns[snapshot_index(lx, lz)] = MapSnapshotColumn { col, rgba };
+        }
+    }
+    snap.terrain_dirty = false;
+    snap.flora_dirty = true;
+    let ms = t0.elapsed().as_secs_f32() * 1000.0;
+    cache.builds += 1;
+    cache.build_ms += ms;
+    cache.builds_this_frame += 1;
+    cache.build_ms_this_frame += ms;
+    cache.chunks.insert(coord_xz, snap);
+}
+
+fn snapshot_needs_terrain(cache: &MapTerrainCache, coord_xz: IVec2) -> bool {
+    cache
+        .chunks
+        .get(&coord_xz)
+        .map(|s| s.terrain_dirty)
+        .unwrap_or(true)
+}
+fn snapshot_needs_flora(cache: &MapTerrainCache, coord_xz: IVec2) -> bool {
+    cache
+        .chunks
+        .get(&coord_xz)
+        .map(|s| s.terrain_dirty || s.flora_dirty)
+        .unwrap_or(true)
+}
+fn build_snapshot_flora(
+    cache: &mut MapTerrainCache,
+    generator: &WorldGenResource,
+    manager: &ChunkManager,
+    coord_xz: IVec2,
+) {
+    if snapshot_needs_terrain(cache, coord_xz) {
+        build_snapshot_terrain(cache, generator, manager, coord_xz);
+    }
+    let Some(mut snap) = cache.chunks.remove(&coord_xz) else {
+        return;
+    };
+    snap.last_used = cache.frame;
+    let t0 = std::time::Instant::now();
+    snap.tree_cov = [0u8; MAP_FLORA_CELLS];
+    snap.bush_cov = [0u8; MAP_FLORA_CELLS];
+    snap.tree_meta = [0u8; MAP_FLORA_CELLS];
+    snap.bush_meta = [0u8; MAP_FLORA_CELLS];
+
+    let cols_per_side = CHUNK_X / BLOCKS_PER_METRE as usize;
+    let chunk_world_min_x = coord_xz.x * CHUNK_X as i32;
+    let chunk_world_min_z = coord_xz.y * CHUNK_Z as i32;
+    let chunk_world_max_x = chunk_world_min_x + CHUNK_X as i32;
+    let chunk_world_max_z = chunk_world_min_z + CHUNK_Z as i32;
+
+    let mut any_loaded = false;
+    for (chunk_coord, chunk) in manager.chunks.iter() {
+        let cminx = chunk_coord.x * CHUNK_X as i32;
+        let cmaxx = cminx + CHUNK_X as i32;
+        let cminz = chunk_coord.z * CHUNK_Z as i32;
+        let cmaxz = cminz + CHUNK_Z as i32;
+        if cmaxx <= chunk_world_min_x
+            || cminx >= chunk_world_max_x
+            || cmaxz <= chunk_world_min_z
+            || cminz >= chunk_world_max_z
+        {
+            continue;
+        }
+        any_loaded = true;
+        // Actual loaded chunk voxel projection into 0.5m raster. Captures player modifications.
+        for lz in 0..CHUNK_Z {
+            for lx in 0..CHUNK_X {
+                let wx_detail = cminx + lx as i32;
+                let wz_detail = cminz + lz as i32;
+                let local_x = (wx_detail - chunk_world_min_x) as f32 + 0.5;
+                let local_z = (wz_detail - chunk_world_min_z) as f32 + 0.5;
+                let fx = (local_x * (MAP_FLORA_RASTER as f32 / CHUNK_X as f32)) as usize;
+                let fz = (local_z * (MAP_FLORA_RASTER as f32 / CHUNK_Z as f32)) as usize;
+                if fx >= MAP_FLORA_RASTER || fz >= MAP_FLORA_RASTER {
+                    continue;
+                }
+                let i = flora_raster_index(fx, fz);
+                for ly in (0..CHUNK_Y).rev() {
+                    let voxel = chunk.data.get_local(lx, ly, lz);
+                    if voxel.is_air() {
+                        continue;
+                    }
+                    let shape = voxel.shape();
+                    let block = voxel.block();
+                    if block == Block::Leaves || matches!(shape, Shape::Foliage) {
+                        snap.tree_cov[i] = snap.tree_cov[i].saturating_add(24);
+                        if snap.tree_meta[i] == 0 {
+                            snap.tree_meta[i] = 1;
+                        }
+                    } else if matches!(shape, Shape::SmallFoliage) {
+                        snap.bush_cov[i] = snap.bush_cov[i].saturating_add(36);
+                        if snap.bush_meta[i] == 0 {
+                            snap.bush_meta[i] = 1;
+                        }
+                    } else if matches!(shape, Shape::Trunk | Shape::DebarkedTrunk) {
+                        snap.tree_cov[i] = snap.tree_cov[i].saturating_add(10);
+                        if snap.tree_meta[i] == 0 {
+                            snap.tree_meta[i] = 1;
+                        }
+                        // don't break: foliage above may have been found in other cells; but top-down same cell means canopy likely above
+                    } else if block.is_solid() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if !any_loaded {
+        // Deterministic base from actual worldgen placement rules via VegetationSink.
+        let seed = generator.0.seed;
+        let mut sink = MapCanopySink::new(coord_xz, 0, CHUNK_Y as i32 * 4);
+        for lz in 0..cols_per_side {
+            for lx in 0..cols_per_side {
+                let wx = coord_xz.x * cols_per_side as i32 + lx as i32;
+                let wz = coord_xz.y * cols_per_side as i32 + lz as i32;
+                let col = generator.0.map_column_at(wx, wz);
+                if col.flora == MapFloraKind::Tree {
+                    rasterize_tree_plan_into_sink(&generator.0, &mut sink, seed, wx, wz, &col);
+                } else if col.flora == MapFloraKind::Bush {
+                    rasterize_bush_plan_into_sink(&generator.0, &mut sink, seed, wx, wz, &col);
+                }
+            }
+        }
+        snap.tree_cov = sink.tree_cov;
+        snap.bush_cov = sink.bush_cov;
+        snap.tree_meta = sink.tree_meta;
+        snap.bush_meta = sink.bush_meta;
+
+        // Apply vegetation-related detail edits for unloaded edited chunks.
+        let detail_min_x = chunk_world_min_x * BLOCKS_PER_METRE as i32;
+        let detail_min_z = chunk_world_min_z * BLOCKS_PER_METRE as i32;
+        let detail_max_x = chunk_world_max_x * BLOCKS_PER_METRE as i32;
+        let detail_max_z = chunk_world_max_z * BLOCKS_PER_METRE as i32;
+        for (pos, voxel) in &manager.detail_edits {
+            if pos.x < detail_min_x
+                || pos.x >= detail_max_x
+                || pos.z < detail_min_z
+                || pos.z >= detail_max_z
+            {
+                continue;
+            }
+            let local_x = (pos.x - detail_min_x) as f32 / BLOCKS_PER_METRE;
+            let local_z = (pos.z - detail_min_z) as f32 / BLOCKS_PER_METRE;
+            let fx =
+                ((local_x * 2.0).floor() as isize).clamp(0, MAP_FLORA_RASTER as isize - 1) as usize;
+            let fz =
+                ((local_z * 2.0).floor() as isize).clamp(0, MAP_FLORA_RASTER as isize - 1) as usize;
+            let i = flora_raster_index(fx, fz);
+            if voxel.is_air() {
+                // Local removal only.
+                snap.tree_cov[i] = snap.tree_cov[i].saturating_sub(48);
+                snap.bush_cov[i] = snap.bush_cov[i].saturating_sub(64);
+                if snap.tree_cov[i] == 0 {
+                    snap.tree_meta[i] = 0;
+                }
+                if snap.bush_cov[i] == 0 {
+                    snap.bush_meta[i] = 0;
+                }
+            } else {
+                let shape = voxel.shape();
+                let block = voxel.block();
+                if block == Block::Leaves || matches!(shape, Shape::Foliage) {
+                    snap.tree_cov[i] = snap.tree_cov[i].saturating_add(32);
+                    snap.tree_meta[i] = 1;
+                } else if matches!(shape, Shape::SmallFoliage) {
+                    snap.bush_cov[i] = snap.bush_cov[i].saturating_add(40);
+                    snap.bush_meta[i] = 1;
+                } else if matches!(shape, Shape::Trunk | Shape::DebarkedTrunk) {
+                    snap.tree_cov[i] = snap.tree_cov[i].saturating_add(12);
+                    if snap.tree_meta[i] == 0 {
+                        snap.tree_meta[i] = 1;
+                    }
+                }
+            }
+        }
+    }
+
+    let mip_t0 = std::time::Instant::now();
+    build_flora_mips(
+        &snap.tree_cov,
+        &mut snap.tree_mip1,
+        &mut snap.tree_mip2,
+        &mut snap.tree_mip3,
+    );
+    build_flora_mips(
+        &snap.bush_cov,
+        &mut snap.bush_mip1,
+        &mut snap.bush_mip2,
+        &mut snap.bush_mip3,
+    );
+    let mip_ms = mip_t0.elapsed().as_secs_f32() * 1000.0;
+
+    snap.has_flora = snap.tree_cov.iter().any(|&v| v != 0) || snap.bush_cov.iter().any(|&v| v != 0);
+    snap.flora_dirty = false;
+    let ms = t0.elapsed().as_secs_f32() * 1000.0;
+    cache.builds += 1;
+    cache.build_ms += ms;
+    cache.builds_this_frame += 1;
+    cache.build_ms_this_frame += ms;
+    cache.flora_build_ms += ms - mip_ms;
+    cache.flora_mip_ms += mip_ms;
+    cache.chunks.insert(coord_xz, snap);
 }
 
 fn setup_map_render_target(mut images: ResMut<Assets<Image>>, mut state: ResMut<MapState>) {
@@ -565,10 +1244,15 @@ fn setup_map_ui(mut commands: Commands, theme: Res<UiTheme>, state: Res<MapState
     ));
 }
 
+#[allow(clippy::type_complexity)]
 fn sync_map_target(
     ui: Res<UiManager>,
     mut state: ResMut<MapState>,
     player: Query<&Transform, With<Player>>,
+    mut camera: Query<
+        (&mut Camera, &mut Transform, &mut Projection),
+        (With<MapCamera>, Without<Player>),
+    >,
 ) {
     let open = ui.is_open(Overlay::Map);
     if state.target_open != open {
@@ -578,9 +1262,26 @@ fn sync_map_target(
                 state.center_xz = Vec2::new(p.translation.x, p.translation.z);
                 state.initialized = true;
             }
+            // Snap map camera immediately on open to avoid one-frame stale/cave view.
+            if let Ok((mut cam, mut transform, mut projection)) = camera.single_mut() {
+                let active_3d = state.mode == MapMode::Overhead3D;
+                cam.is_active = active_3d;
+                if active_3d {
+                    let center = Vec3::new(state.center_xz.x, 0.0, state.center_xz.y);
+                    *transform = Transform::from_translation(center + Vec3::Y * state.zoom)
+                        .looking_at(center, Vec3::NEG_Z);
+                    if let Projection::Perspective(p) = &mut *projection {
+                        p.far =
+                            (state.zoom + 300.0 * BLOCKS_PER_METRE).max(500.0 * BLOCKS_PER_METRE);
+                    }
+                }
+            }
         } else {
             state.dragging = false;
             state.last_cursor = None;
+            if let Ok((mut cam, _, _)) = camera.single_mut() {
+                cam.is_active = false;
+            }
         }
     }
 }
@@ -650,6 +1351,56 @@ fn handle_map_drag(
     state.center_xz.y -= delta.y * (world_size.y / py_size) * PAN_SPEED;
 }
 
+fn update_map_mode(
+    keys: Res<ButtonInput<KeyCode>>,
+    ui: Res<UiManager>,
+    mut state: ResMut<MapState>,
+) {
+    if !ui.is_open(Overlay::Map) {
+        return;
+    }
+    if keys.just_pressed(KeyCode::Tab) {
+        state.mode = match state.mode {
+            MapMode::Overhead3D => MapMode::TopDown2D,
+            MapMode::TopDown2D => MapMode::Overhead3D,
+        };
+    }
+}
+
+pub struct MapPlugin;
+
+impl Plugin for MapPlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<MapState>()
+            .init_resource::<MapExploration>()
+            .init_resource::<MapTerrainCache>()
+            .add_systems(
+                Update,
+                (
+                    sync_map_target,
+                    animate_map_transition,
+                    handle_map_drag,
+                    handle_map_zoom,
+                    update_map_mode,
+                    update_map_exploration,
+                    update_fog_image,
+                    update_map_camera,
+                    update_map_ui,
+                    style_map_mode_tabs,
+                )
+                    .chain()
+                    .in_set(MapSystems),
+            );
+        app.add_observer(on_map_mode_tab_activate);
+        app.add_systems(Startup, (setup_map_render_target, setup_map_ui).chain());
+    }
+}
+
+#[derive(Resource, Default)]
+pub struct MapExplorationState {
+    last_player_cell: Option<IVec2>,
+}
+
 fn visible_world_size(state: &MapState) -> Vec2 {
     let fov = 35f32.to_radians();
     let height = 2.0 * state.zoom * (fov * 0.5).tan();
@@ -667,38 +1418,6 @@ fn explore_cell_center(cell: IVec2) -> Vec2 {
     Vec2::new((cell.x as f32 + 0.5) * s, (cell.y as f32 + 0.5) * s)
 }
 
-fn update_map_mode(
-    keys: Res<ButtonInput<KeyCode>>,
-    ui: Res<UiManager>,
-    mut state: ResMut<MapState>,
-) {
-    if !ui.is_open(Overlay::Map) {
-        return;
-    }
-    if keys.just_pressed(KeyCode::Tab) {
-        state.mode = match state.mode {
-            MapMode::Overhead3D => MapMode::TopDown2D,
-            MapMode::TopDown2D => MapMode::Overhead3D,
-        };
-    }
-}
-
-fn sample_column(
-    cache: &mut HashMap<IVec2, MapColumn>,
-    generator: &WorldGenResource,
-    x: i32,
-    z: i32,
-) -> MapColumn {
-    let key = IVec2::new(x, z);
-    if let Some(c) = cache.get(&key) {
-        return *c;
-    }
-    let c = generator.0.map_column_at(x, z);
-    cache.insert(key, c);
-    c
-}
-
-#[inline]
 fn hash01(x: i32, z: i32, salt: u32) -> f32 {
     let mut n = (x as u32).wrapping_mul(374761393)
         ^ (z as u32).wrapping_mul(668265263)
@@ -708,167 +1427,33 @@ fn hash01(x: i32, z: i32, salt: u32) -> f32 {
     (n & 0xFFFF) as f32 / 65535.0
 }
 
-fn biome_base_color(col: MapColumn) -> [f32; 3] {
-    if col.height < SEA_LEVEL_WORLD || col.surface.is_water() {
-        let depth = (SEA_LEVEL_WORLD - col.height).max(0) as f32;
-        let t = (depth / 18.0).clamp(0.0, 1.0);
-        let shallow = [76.0, 148.0, 176.0];
-        let deep = [24.0, 58.0, 110.0];
-        return [
-            shallow[0] + (deep[0] - shallow[0]) * t,
-            shallow[1] + (deep[1] - shallow[1]) * t,
-            shallow[2] + (deep[2] - shallow[2]) * t,
-        ];
+fn visible_signature(exploration: &MapExploration) -> (IVec2, IVec2, usize) {
+    let mut min = IVec2::splat(i32::MAX);
+    let mut max = IVec2::splat(i32::MIN);
+    for c in &exploration.visible {
+        min = min.min(*c);
+        max = max.max(*c);
     }
-    let shore = (col.height - SEA_LEVEL_WORLD) as f32;
-    if shore <= 1.5 && matches!(col.surface, Block::Sand | Block::RedSandstone) {
-        return [194.0, 178.0, 132.0];
+    if exploration.visible.is_empty() {
+        min = IVec2::splat(i32::MIN);
+        max = IVec2::splat(i32::MIN);
     }
-    match col.biome {
-        BiomeId::Desert => [198.0, 168.0, 112.0],
-        BiomeId::Mesa => [176.0, 118.0, 86.0],
-        BiomeId::Alpine => {
-            if col.has_snow {
-                [214.0, 220.0, 228.0]
-            } else {
-                [142.0, 136.0, 128.0]
-            }
-        }
-        BiomeId::Plains => {
-            if col.has_turf {
-                [108.0, 150.0, 78.0]
-            } else {
-                [140.0, 128.0, 96.0]
-            }
-        }
-        BiomeId::Forest => {
-            if col.has_turf {
-                [72.0, 114.0, 62.0]
-            } else {
-                [98.0, 90.0, 72.0]
-            }
-        }
-    }
-}
-
-#[allow(dead_code)]
-fn flora_from_loaded_world(
-    manager: &ChunkManager,
-    wx: i32,
-    wz: i32,
-    surface_height_m: i32,
-) -> Option<MapFloraKind> {
-    let base_x = wx * BLOCKS_PER_METRE as i32;
-    let base_z = wz * BLOCKS_PER_METRE as i32;
-    let probe = IVec3::new(base_x, surface_height_m * BLOCKS_PER_METRE as i32, base_z);
-    let coord = detail_to_chunk(probe);
-    if !manager.chunks.contains_key(&coord) {
-        return None;
-    }
-    // Scan only the plausible flora band above surface. Early exit on first hit.
-    let y_min = (surface_height_m + 1) * BLOCKS_PER_METRE as i32;
-    let y_max = (surface_height_m + 16) * BLOCKS_PER_METRE as i32;
-    for y in (y_min..=y_max).rev() {
-        for lx in 0..BLOCKS_PER_METRE as i32 {
-            for lz in 0..BLOCKS_PER_METRE as i32 {
-                let Some(voxel) =
-                    manager.get_voxel_if_loaded(IVec3::new(base_x + lx, y, base_z + lz))
-                else {
-                    continue;
-                };
-                if voxel.is_air() {
-                    continue;
-                }
-                let shape = voxel.shape();
-                if voxel.block() == Block::Leaves || matches!(shape, Shape::Foliage) {
-                    return Some(MapFloraKind::Tree);
-                }
-                if matches!(shape, Shape::SmallFoliage) {
-                    return Some(MapFloraKind::Bush);
-                }
-                if matches!(shape, Shape::Trunk | Shape::DebarkedTrunk) {
-                    return Some(MapFloraKind::Tree);
-                }
-            }
-        }
-    }
-    Some(MapFloraKind::None)
-}
-fn terrain_color_at(
-    cache: &mut HashMap<IVec2, MapColumn>,
-    generator: &WorldGenResource,
-    wx: i32,
-    wz: i32,
-) -> [u8; 4] {
-    let col = sample_column(cache, generator, wx, wz);
-    let mut rgb = biome_base_color(col);
-
-    let elev = (col.height - SEA_LEVEL_WORLD) as f32;
-    let elev_t = (elev / 80.0).clamp(-0.5, 1.0);
-    let elev_factor = 1.0 + elev_t * 0.18;
-    rgb[0] *= elev_factor;
-    rgb[1] *= elev_factor;
-    rgb[2] *= elev_factor;
-
-    let h_l = sample_column(cache, generator, wx - 1, wz).height as f32;
-    let h_r = sample_column(cache, generator, wx + 1, wz).height as f32;
-    let h_u = sample_column(cache, generator, wx, wz - 1).height as f32;
-    let h_d = sample_column(cache, generator, wx, wz + 1).height as f32;
-    let shade = ((h_r - h_l) * -0.08 + (h_d - h_u) * -0.08).clamp(-0.35, 0.35);
-    let hill = 1.0 + shade;
-    rgb[0] *= hill;
-    rgb[1] *= hill;
-    rgb[2] *= hill;
-
-    if col.height >= SEA_LEVEL_WORLD && col.supports_flora {
-        let n = hash01(wx, wz, 0x0A11_CE55);
-        if col.biome == BiomeId::Forest {
-            let canopy = (col.forest * 0.7 + n * 0.3).clamp(0.0, 1.0);
-            let dark = 0.75 + (1.0 - canopy) * 0.25;
-            rgb[0] *= dark * 0.92;
-            rgb[1] *= dark;
-            rgb[2] *= dark * 0.90;
-            if n > 0.82 {
-                rgb[0] *= 0.88;
-                rgb[1] *= 0.92;
-                rgb[2] *= 0.86;
-            }
-        } else if col.biome == BiomeId::Plains && col.has_turf {
-            let g = 0.95 + n * 0.1;
-            rgb[0] *= 0.97;
-            rgb[1] *= g;
-            rgb[2] *= 0.95;
-        } else if col.biome == BiomeId::Desert {
-            let d = 0.95 + n * 0.08;
-            rgb[0] *= d;
-            rgb[1] *= 0.96 + n * 0.05;
-            rgb[2] *= 0.93;
-        }
-    }
-
-    if col.height >= SEA_LEVEL_WORLD
-        && col.height <= SEA_LEVEL_WORLD + 1
-        && matches!(col.surface, Block::Sand | Block::RedSandstone)
-    {
-        rgb[0] = rgb[0] * 0.85 + 210.0 * 0.15;
-        rgb[1] = rgb[1] * 0.85 + 196.0 * 0.15;
-        rgb[2] = rgb[2] * 0.85 + 150.0 * 0.15;
-    }
-
-    [
-        rgb[0].clamp(0.0, 255.0) as u8,
-        rgb[1].clamp(0.0, 255.0) as u8,
-        rgb[2].clamp(0.0, 255.0) as u8,
-        255,
-    ]
+    (min, max, exploration.visible.len())
 }
 
 fn update_map_exploration(
     player: Query<&Transform, With<Player>>,
     mut exploration: ResMut<MapExploration>,
+    mut expl_state: Local<MapExplorationState>,
 ) {
     let Ok(tf) = player.single() else { return };
     let pos = Vec2::new(tf.translation.x, tf.translation.z);
+    let player_cell = world_to_explore_cell(pos);
+    if expl_state.last_player_cell == Some(player_cell) && !exploration.explored.is_empty() {
+        return;
+    }
+    expl_state.last_player_cell = Some(player_cell);
+
     let discover_r = EXPLORE_DISCOVER_RADIUS_M * BLOCKS_PER_METRE;
     let visible_r = EXPLORE_VISIBLE_RADIUS_M * BLOCKS_PER_METRE;
     let max_r = discover_r.max(visible_r);
@@ -890,29 +1475,17 @@ fn update_map_exploration(
     }
 }
 
-fn visible_signature(exploration: &MapExploration) -> (IVec2, IVec2, usize) {
-    let mut min = IVec2::splat(i32::MAX);
-    let mut max = IVec2::splat(i32::MIN);
-    for c in &exploration.visible {
-        min = min.min(*c);
-        max = max.max(*c);
-    }
-    if exploration.visible.is_empty() {
-        min = IVec2::splat(i32::MIN);
-        max = IVec2::splat(i32::MIN);
-    }
-    (min, max, exploration.visible.len())
-}
-
 fn update_fog_image(
     time: Res<Time>,
     mut state: ResMut<MapState>,
+    mut cache: ResMut<MapTerrainCache>,
     exploration: Res<MapExploration>,
     generator: Res<WorldGenResource>,
     manager: Res<ChunkManager>,
     mut images: ResMut<Assets<Image>>,
 ) {
-    state.perf_timer += time.delta_secs();
+    // Only render/snapshot-build when Explore map is actually open. Exploration accumulation
+    // runs separately and continues while map is closed.
     if state.mode != MapMode::TopDown2D {
         state.last_fog_mode = Some(state.mode);
         return;
@@ -933,26 +1506,21 @@ fn update_fog_image(
         && (state.center_xz.x - state.buffer_center_xz.x).abs() <= vis.x * BUFFER_MARGIN * 0.5
         && (state.center_xz.y - state.buffer_center_xz.y).abs() <= vis.y * BUFFER_MARGIN * 0.5;
 
-    let need_terrain_full = mode_changed || zoom_changed || !buffer_covers;
+    let need_terrain_full = mode_changed || !state.buffer_valid || !buffer_covers;
     let need_terrain_patch = !need_terrain_full && explored_changed;
     let need_fog = need_terrain_full || need_terrain_patch || visible_changed;
-    if !need_fog {
-        if state.perf_timer >= 1.0 {
-            info!(
-                "map perf: cached (0.00ms gen/upload) over {:.2}s",
-                state.perf_timer
-            );
-            state.perf_accum_terrain_ms = 0.0;
-            state.perf_accum_fog_ms = 0.0;
-            state.perf_accum_upload_ms = 0.0;
-            state.perf_frames = 0;
-            state.perf_timer = 0.0;
-        }
+    let regen_content = need_terrain_full || need_terrain_patch;
+
+    if !need_fog && cache.queue_len == 0 {
         return;
     }
 
     let now = time.elapsed_secs();
-    if !need_terrain_full && need_fog && now - state.last_fog_update < FOG_UPDATE_INTERVAL {
+    if !need_terrain_full
+        && need_fog
+        && cache.queue_len == 0
+        && now - state.last_fog_update < FOG_UPDATE_INTERVAL
+    {
         return;
     }
 
@@ -960,13 +1528,11 @@ fn update_fog_image(
         state.buffer_center_xz = state.center_xz;
         state.buffer_zoom = state.zoom;
         state.buffer_valid = true;
-        state.flora_cache.clear();
     }
 
-    let start_total = std::time::Instant::now();
     let w = FOG_IMAGE_WIDTH as i32;
-    let h = FOG_IMAGE_HEIGHT as i32;
-    let expected = (w as usize) * (h as usize) * 4;
+    let h_px = FOG_IMAGE_HEIGHT as i32;
+    let expected = (w as usize) * (h_px as usize) * 4;
     if state.raw_terrain.len() != expected {
         state.raw_terrain = [0u8, 0, 0, 0].repeat(expected / 4);
     }
@@ -976,262 +1542,228 @@ fn update_fog_image(
 
     let mut terrain = std::mem::take(&mut state.raw_terrain);
     let mut out = std::mem::take(&mut state.raw_explore);
-    if terrain.len() != expected {
-        terrain = [0u8, 0, 0, 0].repeat(expected / 4);
-    }
-    if out.len() != expected {
-        out = [0u8, 0, 0, 0].repeat(expected / 4);
-    }
 
-    let t0 = std::time::Instant::now();
-    let regen_content = need_terrain_full || need_terrain_patch || need_fog;
+    cache.touch_frame();
+    let cols_per_side = CHUNK_X as i32 / BLOCKS_PER_METRE as i32;
+    let min_wx =
+        ((state.buffer_center_xz.x - buffer_world_w * 0.5) / BLOCKS_PER_METRE).floor() as i32 - 1;
+    let max_wx =
+        ((state.buffer_center_xz.x + buffer_world_w * 0.5) / BLOCKS_PER_METRE).ceil() as i32 + 1;
+    let min_wz =
+        ((state.buffer_center_xz.y - buffer_world_h * 0.5) / BLOCKS_PER_METRE).floor() as i32 - 1;
+    let max_wz =
+        ((state.buffer_center_xz.y + buffer_world_h * 0.5) / BLOCKS_PER_METRE).ceil() as i32 + 1;
+    let min_chunk = IVec2::new(
+        min_wx.div_euclid(cols_per_side),
+        min_wz.div_euclid(cols_per_side),
+    );
+    let max_chunk = IVec2::new(
+        max_wx.div_euclid(cols_per_side),
+        max_wz.div_euclid(cols_per_side),
+    );
+    let center_chunk = IVec2::new(
+        (state.buffer_center_xz.x / BLOCKS_PER_METRE).floor() as i32 / cols_per_side,
+        (state.buffer_center_xz.y / BLOCKS_PER_METRE).floor() as i32 / cols_per_side,
+    );
+    let keep_radius = ((buffer_world_w.max(buffer_world_h) / (CHUNK_X as f32)) as i32)
+        + MAP_CACHE_PRUNE_MARGIN_CHUNKS;
+    cache.prune(center_chunk, keep_radius.max(8));
 
-    if regen_content {
-        let cell_size = EXPLORE_CELL_METRES * BLOCKS_PER_METRE;
-        let min_cell = world_to_explore_cell(Vec2::new(
-            state.buffer_center_xz.x - buffer_world_w * 0.5,
-            state.buffer_center_xz.y - buffer_world_h * 0.5,
-        ));
-        let max_cell = world_to_explore_cell(Vec2::new(
-            state.buffer_center_xz.x + buffer_world_w * 0.5,
-            state.buffer_center_xz.y + buffer_world_h * 0.5,
-        ));
-
-        for cz in min_cell.y..=max_cell.y {
-            for cx in min_cell.x..=max_cell.x {
-                let cell = IVec2::new(cx, cz);
-                let explored = exploration.explored.contains(&cell);
-                let wx0 = cx as f32 * cell_size;
-                let wz0 = cz as f32 * cell_size;
-                let wx1 = wx0 + cell_size;
-                let wz1 = wz0 + cell_size;
-                let px0 = (((wx0 - (state.buffer_center_xz.x - buffer_world_w * 0.5))
-                    / buffer_world_w)
-                    * w as f32)
-                    .floor() as i32;
-                let px1 = (((wx1 - (state.buffer_center_xz.x - buffer_world_w * 0.5))
-                    / buffer_world_w)
-                    * w as f32)
-                    .ceil() as i32;
-                let py0 = (((wz0 - (state.buffer_center_xz.y - buffer_world_h * 0.5))
-                    / buffer_world_h)
-                    * h as f32)
-                    .floor() as i32;
-                let py1 = (((wz1 - (state.buffer_center_xz.y - buffer_world_h * 0.5))
-                    / buffer_world_h)
-                    * h as f32)
-                    .ceil() as i32;
-                let px0 = px0.clamp(0, w);
-                let px1 = px1.clamp(0, w);
-                let py0 = py0.clamp(0, h);
-                let py1 = py1.clamp(0, h);
-                if px0 >= px1 || py0 >= py1 {
-                    continue;
-                }
-                if !(need_terrain_full || (need_terrain_patch && explored)) {
-                    continue;
-                }
-
-                let mut last_wx_i = i32::MIN;
-                let mut last_wz_i = i32::MIN;
-                let mut last_c = [12u8, 14u8, 18u8, 255u8];
-                for py in py0..py1 {
-                    for px in px0..px1 {
-                        let idx = ((py * w + px) * 4) as usize;
-                        if explored {
-                            let u = (px as f32 + 0.5) / w as f32;
-                            let v = (py as f32 + 0.5) / h as f32;
-                            let wxp = state.buffer_center_xz.x + (u - 0.5) * buffer_world_w;
-                            let wzp = state.buffer_center_xz.y + (v - 0.5) * buffer_world_h;
-                            let wx_i = (wxp / BLOCKS_PER_METRE).floor() as i32;
-                            let wz_i = (wzp / BLOCKS_PER_METRE).floor() as i32;
-                            let c = if wx_i == last_wx_i && wz_i == last_wz_i {
-                                last_c
-                            } else {
-                                let c = terrain_color_at(
-                                    &mut state.sample_cache,
-                                    &generator,
-                                    wx_i,
-                                    wz_i,
-                                );
-                                last_wx_i = wx_i;
-                                last_wz_i = wz_i;
-                                last_c = c;
-                                c
-                            };
-                            if idx + 3 < terrain.len() {
-                                terrain[idx] = c[0];
-                                terrain[idx + 1] = c[1];
-                                terrain[idx + 2] = c[2];
-                                terrain[idx + 3] = 255;
-                            }
-                        } else if idx + 3 < terrain.len() {
-                            terrain[idx] = 0;
-                            terrain[idx + 1] = 0;
-                            terrain[idx + 2] = 0;
-                            terrain[idx + 3] = 0;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Flora overlay from actual loaded chunk data. Scanned on terrain regen only.
-        if need_terrain_full || need_terrain_patch {
-            let px_per_m = (w as f32 / buffer_world_w).max(0.001);
-            let min_wx = ((state.buffer_center_xz.x - buffer_world_w * 0.5) / BLOCKS_PER_METRE)
-                .floor() as i32
-                - 1;
-            let max_wx = ((state.buffer_center_xz.x + buffer_world_w * 0.5) / BLOCKS_PER_METRE)
-                .ceil() as i32
-                + 1;
-            let min_wz = ((state.buffer_center_xz.y - buffer_world_h * 0.5) / BLOCKS_PER_METRE)
-                .floor() as i32
-                - 1;
-            let max_wz = ((state.buffer_center_xz.y + buffer_world_h * 0.5) / BLOCKS_PER_METRE)
-                .ceil() as i32
-                + 1;
-            let min_detail_x = min_wx * BLOCKS_PER_METRE as i32;
-            let max_detail_x = (max_wx + 1) * BLOCKS_PER_METRE as i32;
-            let min_detail_z = min_wz * BLOCKS_PER_METRE as i32;
-            let max_detail_z = (max_wz + 1) * BLOCKS_PER_METRE as i32;
-
-            for (coord, chunk) in manager.chunks.iter() {
-                let chunk_min_x = coord.x * CHUNK_X as i32;
-                let chunk_max_x = chunk_min_x + CHUNK_X as i32;
-                let chunk_min_z = coord.z * CHUNK_Z as i32;
-                let chunk_max_z = chunk_min_z + CHUNK_Z as i32;
-                if chunk_max_x < min_detail_x
-                    || chunk_min_x > max_detail_x
-                    || chunk_max_z < min_detail_z
-                    || chunk_min_z > max_detail_z
-                {
-                    continue;
-                }
-                for lz in 0..CHUNK_Z {
-                    for lx in 0..CHUNK_X {
-                        let world_x = chunk_min_x + lx as i32;
-                        let world_z = chunk_min_z + lz as i32;
-                        let wx_i = (world_x as f32 / BLOCKS_PER_METRE).floor() as i32;
-                        let wz_i = (world_z as f32 / BLOCKS_PER_METRE).floor() as i32;
-                        let wxp_center = (wx_i as f32 + 0.5) * BLOCKS_PER_METRE;
-                        let wzp_center = (wz_i as f32 + 0.5) * BLOCKS_PER_METRE;
-                        let cell = world_to_explore_cell(Vec2::new(wxp_center, wzp_center));
-                        if !exploration.explored.contains(&cell) {
-                            continue;
-                        }
-
-                        let mut flora = MapFloraKind::None;
-                        // Scan down column in this chunk; find topmost flora shape.
-                        for ly in (0..CHUNK_Y).rev() {
-                            let voxel = chunk.data.get_local(lx, ly, lz);
-                            if voxel.is_air() {
-                                continue;
-                            }
-                            let shape = voxel.shape();
-                            let block = voxel.block();
-                            if block == Block::Leaves || matches!(shape, Shape::Foliage) {
-                                flora = MapFloraKind::Tree;
-                                break;
-                            }
-                            if matches!(shape, Shape::SmallFoliage) {
-                                flora = MapFloraKind::Bush;
-                                break;
-                            }
-                            if matches!(shape, Shape::Trunk | Shape::DebarkedTrunk) {
-                                flora = MapFloraKind::Tree;
-                                break;
-                            }
-                            if block.is_solid() {
-                                break;
-                            } // hit ground, no flora above in this local stack
-                        }
-                        if flora == MapFloraKind::None {
-                            continue;
-                        }
-
-                        let col = sample_column(&mut state.sample_cache, &generator, wx_i, wz_i);
-                        let (radius_m, canopy, strength) = match flora {
-                            MapFloraKind::Tree => {
-                                let c = match col.biome {
-                                    crate::world::generation_data::BiomeId::Desert => {
-                                        [92.0, 118.0, 62.0]
-                                    }
-                                    crate::world::generation_data::BiomeId::Alpine => {
-                                        [58.0, 92.0, 58.0]
-                                    }
-                                    crate::world::generation_data::BiomeId::Plains => {
-                                        [54.0, 102.0, 48.0]
-                                    }
-                                    _ => [40.0, 88.0, 40.0],
-                                };
-                                (2.6f32, c, 0.72f32)
-                            }
-                            MapFloraKind::Bush => {
-                                let c = match col.biome {
-                                    crate::world::generation_data::BiomeId::Desert => {
-                                        [126.0, 128.0, 74.0]
-                                    }
-                                    crate::world::generation_data::BiomeId::Alpine => {
-                                        [88.0, 112.0, 76.0]
-                                    }
-                                    _ => [74.0, 120.0, 58.0],
-                                };
-                                (1.4f32, c, 0.45f32)
-                            }
-                            MapFloraKind::None => continue,
-                        };
-                        let r_px = (radius_m * px_per_m).ceil() as i32;
-                        let cxp = (((wxp_center
-                            - (state.buffer_center_xz.x - buffer_world_w * 0.5))
-                            / buffer_world_w)
-                            * w as f32) as i32;
-                        let cyp = (((wzp_center
-                            - (state.buffer_center_xz.y - buffer_world_h * 0.5))
-                            / buffer_world_h)
-                            * h as f32) as i32;
-                        let n = hash01(wx_i, wz_i, 0x51ed_270b);
-                        let jitter = 0.92 + n * 0.16;
-                        for dy in -r_px..=r_px {
-                            for dx in -r_px..=r_px {
-                                let px = cxp + dx;
-                                let py = cyp + dy;
-                                if px < 0 || px >= w || py < 0 || py >= h {
-                                    continue;
-                                }
-                                let d2 = (dx * dx + dy * dy) as f32;
-                                let rr = (r_px as f32 + 0.5) * (r_px as f32 + 0.5);
-                                if d2 > rr {
-                                    continue;
-                                }
-                                let idx = ((py * w + px) * 4) as usize;
-                                if idx + 3 >= terrain.len() || terrain[idx + 3] == 0 {
-                                    continue;
-                                }
-                                let edge = (d2 / rr).clamp(0.0, 1.0);
-                                let t =
-                                    ((1.0 - edge).powf(0.8) * strength * jitter).clamp(0.0, 0.85);
-                                let br = terrain[idx] as f32;
-                                let bg = terrain[idx + 1] as f32;
-                                let bb = terrain[idx + 2] as f32;
-                                terrain[idx] = (br + (canopy[0] - br) * t).clamp(0.0, 255.0) as u8;
-                                terrain[idx + 1] =
-                                    (bg + (canopy[1] - bg) * t).clamp(0.0, 255.0) as u8;
-                                terrain[idx + 2] =
-                                    (bb + (canopy[2] - bb) * t).clamp(0.0, 255.0) as u8;
-                            }
-                        }
-                    }
+    let mut pending: Vec<(i32, IVec2)> = Vec::new();
+    for cz in min_chunk.y..=max_chunk.y {
+        for cx in min_chunk.x..=max_chunk.x {
+            let coord = IVec2::new(cx, cz);
+            let needs_terrain = snapshot_needs_terrain(&cache, coord);
+            let needs_flora = regen_content && snapshot_needs_flora(&cache, coord);
+            if needs_terrain || needs_flora {
+                let dist = (cx - center_chunk.x).abs() + (cz - center_chunk.y).abs();
+                pending.push((dist, coord));
+            } else {
+                cache.hits += 1;
+                let frame = cache.frame;
+                if let Some(s) = cache.chunks.get_mut(&coord) {
+                    s.last_used = frame;
                 }
             }
         }
     }
+    pending.sort_by_key(|(d, c)| (*d, c.x, c.y));
+    cache.queue_len = pending.len();
 
-    // Composite cached terrain. Edge fade is handled by a fixed UI overlay (both modes).
-    let n = out.len().min(terrain.len());
-    out[..n].copy_from_slice(&terrain[..n]);
+    for (_, coord) in pending.iter().copied() {
+        if cache.build_ms_this_frame >= MAP_SNAPSHOT_BUILD_BUDGET_MS {
+            break;
+        }
+        let needs_terrain = snapshot_needs_terrain(&cache, coord);
+        let needs_flora = regen_content && snapshot_needs_flora(&cache, coord);
+        if !needs_terrain && !needs_flora {
+            continue;
+        }
+        cache.misses += 1;
+        if needs_terrain {
+            build_snapshot_terrain(&mut cache, &generator, &manager, coord);
+        }
+        if regen_content && snapshot_needs_flora(&cache, coord) {
+            build_snapshot_flora(&mut cache, &generator, &manager, coord);
+        }
+    }
+    // Refresh queue len after budgeted work.
+    cache.queue_len = pending
+        .iter()
+        .filter(|(_, c)| {
+            snapshot_needs_terrain(&cache, *c)
+                || (regen_content && snapshot_needs_flora(&cache, *c))
+        })
+        .count();
 
-    let gen_ms = t0.elapsed().as_secs_f32() * 1000.0;
+    let world_per_px = (buffer_world_w / w as f32)
+        .max(buffer_world_h / h_px as f32)
+        .max(0.001);
+    let base_cell_m = CHUNK_X as f32 / MAP_FLORA_RASTER as f32;
+    // Keep flora squares readable when zoomed in; coarser mips stay gapless.
+    let mip_level = ((world_per_px / base_cell_m).log2().round() as i32).clamp(1, 3);
+
+    #[inline(always)]
+    fn sample_flora_plane(
+        snap: &MapChunkSnapshot,
+        local_x: f32,
+        local_z: f32,
+        tree: bool,
+        mip: i32,
+    ) -> f32 {
+        let (res, plane): (usize, &[u8]) = match (mip, tree) {
+            (0, true) => (MAP_FLORA_RASTER, &snap.tree_cov),
+            (0, false) => (MAP_FLORA_RASTER, &snap.bush_cov),
+            (1, true) => (MAP_FLORA_MIP1, &snap.tree_mip1[..]),
+            (1, false) => (MAP_FLORA_MIP1, &snap.bush_mip1[..]),
+            (2, true) => (MAP_FLORA_MIP2, &snap.tree_mip2[..]),
+            (2, false) => (MAP_FLORA_MIP2, &snap.bush_mip2[..]),
+            (_, true) => (MAP_FLORA_MIP3, &snap.tree_mip3[..]),
+            (_, false) => (MAP_FLORA_MIP3, &snap.bush_mip3[..]),
+        };
+        // Nearest raster cell for solid, gapless square flora tiles.
+        let cell_m = CHUNK_X as f32 / res as f32;
+        let ix = ((local_x / cell_m).floor() as i32).clamp(0, res as i32 - 1) as usize;
+        let iz = ((local_z / cell_m).floor() as i32).clamp(0, res as i32 - 1) as usize;
+        plane[iz * res + ix] as f32 * (1.0 / 255.0)
+    }
+
+    for py in 0..h_px {
+        let v = (py as f32 + 0.5) / h_px as f32;
+        let wzp = state.buffer_center_xz.y + (v - 0.5) * buffer_world_h;
+        let wz_i = (wzp / BLOCKS_PER_METRE).floor() as i32;
+        let chunk_z = wz_i.div_euclid(cols_per_side);
+        let lz = wz_i.rem_euclid(cols_per_side) as usize;
+        let row = py as usize * w as usize;
+
+        let mut px = 0i32;
+        while px < w {
+            let u = (px as f32 + 0.5) / w as f32;
+            let wxp = state.buffer_center_xz.x + (u - 0.5) * buffer_world_w;
+            let wx_i = (wxp / BLOCKS_PER_METRE).floor() as i32;
+            let chunk_x = wx_i.div_euclid(cols_per_side);
+            let lx = wx_i.rem_euclid(cols_per_side) as usize;
+            let coord = IVec2::new(chunk_x, chunk_z);
+
+            let next_wx_boundary = (wx_i as f32 + 1.0) * BLOCKS_PER_METRE;
+            let mut px_end = (((next_wx_boundary
+                - (state.buffer_center_xz.x - buffer_world_w * 0.5))
+                / buffer_world_w)
+                * w as f32)
+                .ceil() as i32;
+            if px_end <= px {
+                px_end = px + 1;
+            }
+            if px_end > w {
+                px_end = w;
+            }
+
+            let cell = world_to_explore_cell(Vec2::new(
+                (wx_i as f32 + 0.5) * BLOCKS_PER_METRE,
+                (wz_i as f32 + 0.5) * BLOCKS_PER_METRE,
+            ));
+            let explored = exploration.explored.contains(&cell);
+            let snap_ref = if explored {
+                cache.chunks.get(&coord)
+            } else {
+                None
+            };
+
+            if let Some(snap) = snap_ref {
+                let si_col = snapshot_index(lx, lz);
+                let base = snap.columns[si_col].rgba;
+                let col = snap.columns[si_col].col;
+                let base_r = base[0] as f32;
+                let base_g = base[1] as f32;
+                let base_b = base[2] as f32;
+                let has_flora = snap.has_flora;
+                let local_fx_base = coord.x as f32 * CHUNK_X as f32;
+                let local_fz =
+                    (wzp - coord.y as f32 * CHUNK_Z as f32).clamp(0.0, CHUNK_Z as f32 - 0.001);
+                let bc = match col.biome {
+                    BiomeId::Desert => (132.0, 136.0, 84.0),
+                    BiomeId::Alpine => (84.0, 112.0, 74.0),
+                    BiomeId::Plains => (82.0, 126.0, 66.0),
+                    BiomeId::Forest => (74.0, 118.0, 60.0),
+                    _ => (78.0, 120.0, 62.0),
+                };
+                let tc = match col.biome {
+                    BiomeId::Desert => (108.0, 126.0, 78.0),
+                    BiomeId::Alpine => (52.0, 88.0, 56.0),
+                    BiomeId::Plains => (62.0, 112.0, 56.0),
+                    BiomeId::Forest => (44.0, 96.0, 46.0),
+                    _ => (54.0, 102.0, 52.0),
+                };
+                for x in px..px_end {
+                    let mut r = base_r;
+                    let mut g = base_g;
+                    let mut b = base_b;
+                    if has_flora {
+                        let wx_x = state.buffer_center_xz.x
+                            + ((x as f32 + 0.5) / w as f32 - 0.5) * buffer_world_w;
+                        let local_fx = (wx_x - local_fx_base).clamp(0.0, CHUNK_X as f32 - 0.001);
+                        let tree_cov =
+                            (sample_flora_plane(snap, local_fx, local_fz, true, mip_level) * 4.0)
+                                .min(1.0);
+                        let bush_cov =
+                            (sample_flora_plane(snap, local_fx, local_fz, false, mip_level) * 4.0)
+                                .min(1.0);
+                        if bush_cov > 0.001 || tree_cov > 0.001 {
+                            let lum = (r * 0.2126 + g * 0.7152 + b * 0.0722) * (1.0 / 255.0);
+                            if bush_cov > 0.001 {
+                                let shade = (0.72 + lum * 0.28).clamp(0.52, 1.0);
+                                r = bc.0 * shade;
+                                g = bc.1 * shade;
+                                b = bc.2 * shade;
+                            }
+                            if tree_cov > 0.001 {
+                                let shade = (0.58 + lum * 0.24).clamp(0.36, 1.0);
+                                r = tc.0 * shade;
+                                g = tc.1 * shade;
+                                b = tc.2 * shade;
+                            }
+                        }
+                    }
+                    let idx = (row + x as usize) * 4;
+                    terrain[idx] = r.clamp(0.0, 255.0) as u8;
+                    terrain[idx + 1] = g.clamp(0.0, 255.0) as u8;
+                    terrain[idx + 2] = b.clamp(0.0, 255.0) as u8;
+                    terrain[idx + 3] = 255;
+                }
+            } else {
+                for x in px..px_end {
+                    let idx = (row + x as usize) * 4;
+                    terrain[idx] = 0;
+                    terrain[idx + 1] = 0;
+                    terrain[idx + 2] = 0;
+                    terrain[idx + 3] = 0;
+                }
+            }
+            px = px_end;
+        }
+    }
+    let ncopy = out.len().min(terrain.len());
+    out[..ncopy].copy_from_slice(&terrain[..ncopy]);
 
     if let Some(mut img) = images.get_mut(&state.explore_image) {
         img.data = Some(out.clone());
@@ -1239,32 +1771,17 @@ fn update_fog_image(
     state.raw_terrain = terrain;
     state.raw_explore = out;
 
-    state.perf_accum_terrain_ms += gen_ms * 0.5;
-    state.perf_accum_fog_ms += gen_ms * 0.5;
-    state.perf_accum_upload_ms += 0.0;
-    state.perf_frames += 1;
     state.last_fog_center = state.center_xz;
     state.last_fog_zoom = state.zoom;
     state.last_fog_mode = Some(MapMode::TopDown2D);
     state.last_explored_len = exploration.explored.len();
     state.last_visible_signature = vis_sig;
-    if regen_content {
-        state.last_fog_update = now;
-    }
-
-    if state.perf_timer >= 1.0 {
-        info!(
-            "map perf: gen {:.2}ms upload {:.2}ms total {:.2}ms (avg over {} frames, dirty)",
-            gen_ms,
-            0.0,
-            start_total.elapsed().as_secs_f32() * 1000.0,
-            state.perf_frames
-        );
-        state.perf_accum_terrain_ms = 0.0;
-        state.perf_accum_fog_ms = 0.0;
-        state.perf_accum_upload_ms = 0.0;
-        state.perf_frames = 0;
-        state.perf_timer = 0.0;
+    if regen_content || need_fog {
+        state.last_fog_update = if cache.queue_len > 0 {
+            now - FOG_UPDATE_INTERVAL
+        } else {
+            now
+        };
     }
 }
 
@@ -1472,5 +1989,168 @@ fn style_map_mode_tabs(
         if border.top != border_c {
             *border = BorderColor::all(border_c);
         }
+    }
+}
+
+#[cfg(test)]
+mod map_flora_parity_tests {
+    use super::*;
+    use crate::world::chunk::ChunkData;
+    use crate::world::generation::{MapColumn, WorldGen};
+
+    fn project_chunkdata_vegetation(
+        data: &ChunkData,
+    ) -> ([u8; MAP_FLORA_CELLS], [u8; MAP_FLORA_CELLS]) {
+        let mut tree = [0u8; MAP_FLORA_CELLS];
+        let mut bush = [0u8; MAP_FLORA_CELLS];
+        let scale = MAP_FLORA_RASTER as f32 / CHUNK_X as f32;
+        for lz in 0..CHUNK_Z {
+            for lx in 0..CHUNK_X {
+                let fx = ((lx as f32) * scale).floor() as usize;
+                let fz = ((lz as f32) * scale).floor() as usize;
+                if fx >= MAP_FLORA_RASTER || fz >= MAP_FLORA_RASTER {
+                    continue;
+                }
+                let i = flora_raster_index(fx, fz);
+                for ly in (0..CHUNK_Y).rev() {
+                    let voxel = data.get_local(lx, ly, lz);
+                    if voxel.is_air() {
+                        continue;
+                    }
+                    let shape = voxel.shape();
+                    let block = voxel.block();
+                    if block == Block::Leaves || matches!(shape, Shape::Foliage) {
+                        tree[i] = tree[i].saturating_add(32);
+                    } else if matches!(shape, Shape::SmallFoliage) {
+                        bush[i] = bush[i].saturating_add(40);
+                    } else if matches!(shape, Shape::Trunk | Shape::DebarkedTrunk) {
+                        tree[i] = tree[i].saturating_add(12);
+                    } else if block.is_solid() {
+                        break;
+                    }
+                }
+            }
+        }
+        (tree, bush)
+    }
+
+    fn project_sink_tree(
+        wg: &WorldGen,
+        seed: u32,
+        wx: i32,
+        wz: i32,
+        col: &MapColumn,
+    ) -> ([u8; MAP_FLORA_CELLS], [u8; MAP_FLORA_CELLS]) {
+        let mut sink = MapCanopySink::new(IVec2::ZERO, 0, CHUNK_Y as i32 * 4);
+        rasterize_tree_plan_into_sink(wg, &mut sink, seed, wx, wz, col);
+        (sink.tree_cov, sink.bush_cov)
+    }
+
+    fn project_sink_bush(
+        wg: &WorldGen,
+        seed: u32,
+        wx: i32,
+        wz: i32,
+        col: &MapColumn,
+    ) -> ([u8; MAP_FLORA_CELLS], [u8; MAP_FLORA_CELLS]) {
+        let mut sink = MapCanopySink::new(IVec2::ZERO, 0, CHUNK_Y as i32 * 4);
+        rasterize_bush_plan_into_sink(wg, &mut sink, seed, wx, wz, col);
+        (sink.tree_cov, sink.bush_cov)
+    }
+
+    fn first_tree_column(
+        wg: &WorldGen,
+    ) -> Option<(
+        i32,
+        i32,
+        MapColumn,
+        i32,
+        crate::world::generation::TreeSpecies,
+    )> {
+        for z in -256..256 {
+            for x in -256..256 {
+                let col = wg.map_column_at(x, z);
+                if col.flora != MapFloraKind::Tree {
+                    continue;
+                }
+                if let Some((trunk_h, species)) = wg.tree_plan_at(x, z)
+                    && wg.tree_has_spacing(x, z, trunk_h)
+                {
+                    return Some((x, z, col, trunk_h, species));
+                }
+            }
+        }
+        None
+    }
+
+    fn first_bush_column(wg: &WorldGen) -> Option<(i32, i32, MapColumn, u32, i32)> {
+        for z in -256..256 {
+            for x in -256..256 {
+                let col = wg.map_column_at(x, z);
+                if col.flora != MapFloraKind::Bush {
+                    continue;
+                }
+                if let Some((roll, kind)) = wg.bush_plan_at(x, z) {
+                    return Some((x, z, col, roll, kind));
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn map_tree_projection_matches_chunkdata_footprint_for_representative_tree() {
+        let wg = WorldGen::new(0x4B54_414C);
+        let (wx, wz, col, _trunk_h, _species) = first_tree_column(&wg).expect("tree");
+        let seed = wg.seed();
+        let scale = BLOCKS_PER_METRE as i32;
+        let lx = wx.rem_euclid(CHUNK_X as i32 / scale) * scale;
+        let lz = wz.rem_euclid(CHUNK_Z as i32 / scale) * scale;
+        let base = (col.height + 1) * scale;
+        let mut chunk = ChunkData::new(IVec3::ZERO);
+        let (sink_tree, sink_bush) = project_sink_tree(&wg, seed, wx, wz, &col);
+        // place into chunk via same plan
+        let (trunk_h, species) = wg.tree_plan_at(wx, wz).unwrap();
+        let roll = hash2(seed ^ 0x51ed_270b, wx, wz);
+        let trunk_storage = IVec3::new(lx, base, lz);
+        match species.kind {
+            crate::world::generation::TreeKind::BroadleafOak => {
+                WorldGen::place_broadleaf_oak(&mut chunk, seed, trunk_storage, trunk_h, roll)
+            }
+            crate::world::generation::TreeKind::Birch => {
+                WorldGen::place_birch(&mut chunk, seed, trunk_storage, trunk_h, roll)
+            }
+            crate::world::generation::TreeKind::Pine => {
+                WorldGen::place_pine(&mut chunk, seed, trunk_storage, trunk_h, roll)
+            }
+            crate::world::generation::TreeKind::Spruce => {
+                WorldGen::place_spruce(&mut chunk, seed, trunk_storage, trunk_h, roll)
+            }
+            crate::world::generation::TreeKind::HardyShrubTree => {
+                WorldGen::place_hardy_shrub_tree(&mut chunk, seed, trunk_storage, trunk_h, roll)
+            }
+        }
+        let (cd_tree, cd_bush) = project_chunkdata_vegetation(&chunk);
+        assert_eq!(sink_tree, cd_tree, "tree coverage mismatch at {wx},{wz}");
+        assert_eq!(sink_bush, cd_bush, "bush coverage mismatch at {wx},{wz}");
+    }
+
+    #[test]
+    fn map_bush_projection_matches_chunkdata_footprint_for_representative_bush() {
+        let wg = WorldGen::new(0x4B54_414C);
+        let (wx, wz, col, _roll, kind) = first_bush_column(&wg).expect("bush");
+        let seed = wg.seed();
+        let scale = BLOCKS_PER_METRE as i32;
+        let lx = wx.rem_euclid(CHUNK_X as i32 / scale) * scale;
+        let lz = wz.rem_euclid(CHUNK_Z as i32 / scale) * scale;
+        let base = (col.height + 1) * scale;
+        let mut chunk = ChunkData::new(IVec3::ZERO);
+        let (sink_tree, sink_bush) = project_sink_bush(&wg, seed, wx, wz, &col);
+        let (roll, kind2) = wg.bush_plan_at(wx, wz).unwrap();
+        assert_eq!(kind, kind2);
+        WorldGen::place_bush_variant(&mut chunk, seed, IVec3::new(lx, base, lz), roll, kind);
+        let (cd_tree, cd_bush) = project_chunkdata_vegetation(&chunk);
+        assert_eq!(sink_tree, cd_tree, "tree coverage mismatch at {wx},{wz}");
+        assert_eq!(sink_bush, cd_bush, "bush coverage mismatch at {wx},{wz}");
     }
 }

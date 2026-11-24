@@ -152,26 +152,58 @@ fn biome_cell_at(seed: u32, x: i32, z: i32, distance: f32) -> (BiomeId, BiomeSam
     (dominant, sample)
 }
 
-/// Place a voxel at a cell-relative offset if the target cell is inside the
-/// chunk and still air. Trees and bushes use this so branches and foliage never
-/// replace a trunk or each other.
-fn place_if_air(data: &mut ChunkData, origin: IVec3, offset: IVec3, voxel: Voxel) {
-    let x = origin.x + offset.x;
-    let y = origin.y + offset.y;
-    let z = origin.z + offset.z;
-    if !(0..CHUNK_X as i32).contains(&x)
-        || !(0..CHUNK_Z as i32).contains(&z)
-        || !(0..CHUNK_Y as i32).contains(&y)
-    {
-        return;
+/// Minimal sink for deterministic vegetation placement. `ChunkData` implements this for
+/// real world generation; the map uses a lightweight sink to capture canopy footprints from
+/// the same placement logic.
+pub trait VegetationSink {
+    #[allow(dead_code)]
+    fn veg_get(&self, x: i32, y: i32, z: i32) -> Voxel;
+    fn veg_set_if_air(&mut self, x: i32, y: i32, z: i32, voxel: Voxel);
+}
+
+impl VegetationSink for ChunkData {
+    #[inline]
+    fn veg_get(&self, x: i32, y: i32, z: i32) -> Voxel {
+        if !(0..CHUNK_X as i32).contains(&x)
+            || !(0..CHUNK_Z as i32).contains(&z)
+            || !(0..CHUNK_Y as i32).contains(&y)
+        {
+            return Voxel::AIR;
+        }
+        self.get_local(x as usize, y as usize, z as usize)
     }
-    if data.get_local(x as usize, y as usize, z as usize).is_air() {
-        data.set_local(x as usize, y as usize, z as usize, voxel);
+
+    #[inline]
+    fn veg_set_if_air(&mut self, x: i32, y: i32, z: i32, voxel: Voxel) {
+        if !(0..CHUNK_X as i32).contains(&x)
+            || !(0..CHUNK_Z as i32).contains(&z)
+            || !(0..CHUNK_Y as i32).contains(&y)
+        {
+            return;
+        }
+        if self.get_local(x as usize, y as usize, z as usize).is_air() {
+            self.set_local(x as usize, y as usize, z as usize, voxel);
+        }
     }
 }
 
-fn place_leaf_cluster(
-    data: &mut ChunkData,
+/// Place a voxel at a cell-relative offset if the target cell is inside the
+/// chunk and still air. Trees and bushes use this so branches and foliage never
+/// replace a trunk or each other.
+fn place_if_air<S: VegetationSink + ?Sized>(
+    data: &mut S,
+    origin: IVec3,
+    offset: IVec3,
+    voxel: Voxel,
+) {
+    let x = origin.x + offset.x;
+    let y = origin.y + offset.y;
+    let z = origin.z + offset.z;
+    data.veg_set_if_air(x, y, z, voxel);
+}
+
+fn place_leaf_cluster<S: VegetationSink + ?Sized>(
+    data: &mut S,
     origin: IVec3,
     center: IVec3,
     radius: i32,
@@ -282,8 +314,8 @@ fn set_centered_clutter(
 /// is 0.5 m long along its orientation, so a run of cells reads as a thin branch
 /// extending out from the centred trunk cube. The limb starts at a trunk-edge
 /// detail cell so it connects to the centred trunk instead of floating away.
-fn place_branch(
-    data: &mut ChunkData,
+fn place_branch<S: VegetationSink + ?Sized>(
+    data: &mut S,
     trunk_storage: IVec3,
     start_dy: i32,
     facing: Facing,
@@ -357,7 +389,7 @@ fn branch_origin(trunk_storage: IVec3, dy: i32, facing: Facing) -> IVec3 {
 
 /// Place one flat root leaving the centred trunk. A single stem segment keeps
 /// the root connected to the trunk without protruding too far.
-fn place_root(data: &mut ChunkData, trunk_storage: IVec3, facing: Facing) {
+fn place_root<S: VegetationSink + ?Sized>(data: &mut S, trunk_storage: IVec3, facing: Facing) {
     let dir = facing.direction();
     let orientation = Orientation::from_up_forward(dir, Vec3::Y);
     let stem = Voxel::from_oriented_parts(Block::Wood, Shape::Stem, orientation);
@@ -366,7 +398,7 @@ fn place_root(data: &mut ChunkData, trunk_storage: IVec3, facing: Facing) {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TreeKind {
+pub enum TreeKind {
     /// The original approved broadleaf reference tree.
     BroadleafOak,
     Birch,
@@ -376,11 +408,11 @@ enum TreeKind {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct TreeSpecies {
-    kind: TreeKind,
-    min_trunk: i32,
-    max_trunk: i32,
-    crown_top: i32,
+pub struct TreeSpecies {
+    pub kind: TreeKind,
+    pub min_trunk: i32,
+    pub max_trunk: i32,
+    pub crown_top: i32,
 }
 
 impl TreeSpecies {
@@ -425,7 +457,7 @@ fn tree_species_for_column(column: &ColumnInfo, roll: u32) -> Option<TreeSpecies
     Some(options[idx])
 }
 
-fn tree_plan_from_column(
+pub(crate) fn tree_plan_from_column(
     seed: u32,
     x: i32,
     z: i32,
@@ -468,7 +500,62 @@ pub struct MapColumn {
     pub flora: MapFloraKind,
 }
 
+/// Public map/helper: deterministic bush kind for a column and roll, matching `place_bushes`.
+#[allow(dead_code)]
+pub fn bush_kind_for_column(column: &MapColumn, roll: u32) -> i32 {
+    match column.biome {
+        BiomeId::Plains => 0,
+        BiomeId::Forest => {
+            if ((roll >> 18) & 1) == 0 {
+                1
+            } else {
+                2
+            }
+        }
+        BiomeId::Alpine => 3,
+        BiomeId::Desert => 4,
+        BiomeId::Mesa => 5,
+    }
+}
+
+/// Public map/helper: should a bush be placed at this column? Uses same deterministic rule.
+#[allow(dead_code)]
+pub fn bush_plan_for_column(seed: u32, x: i32, z: i32, column: &MapColumn) -> Option<(u32, i32)> {
+    if !column.supports_flora || column.height <= SEA_LEVEL_WORLD {
+        return None;
+    }
+    let roll = hash2(seed ^ 0x1b87_3593, x, z);
+    // bush_threshold is encoded in sample; MapColumn doesn't carry it. Caller should check with map_flora_at logic? Better expose threshold via column_at sample.
+    // For now, use map_flora_at/bush decision through column: caller has MapColumn.flora.
+    if column.flora != MapFloraKind::Bush {
+        return None;
+    }
+    Some((roll, bush_kind_for_column(column, roll)))
+}
+
+/// Public map/helper: deterministic bush plan for a map column. Uses same MapColumn flora decision.
+#[allow(dead_code)]
+pub fn bush_plan_for_map_column(
+    seed: u32,
+    x: i32,
+    z: i32,
+    column: &MapColumn,
+) -> Option<(u32, i32)> {
+    if column.flora != MapFloraKind::Bush
+        || !column.supports_flora
+        || column.height <= SEA_LEVEL_WORLD
+    {
+        return None;
+    }
+    let roll = hash2(seed ^ 0x1b87_3593, x, z);
+    Some((roll, bush_kind_for_column(column, roll)))
+}
 impl WorldGen {
+    #[allow(dead_code)]
+    pub fn seed(&self) -> u32 {
+        self.seed
+    }
+
     /// Deterministic flora marker for map rendering. Uses same rules as worldgen placement checks
     /// (density/hash/biome), without chunk-local occupancy.
     #[allow(dead_code)]
@@ -492,7 +579,7 @@ impl WorldGen {
 /// reuses them for terrain, padding, trees, bushes and loose detail, so adding
 /// graph nodes does not multiply noise cost per detail cell.
 #[derive(Clone, Copy)]
-struct ColumnInfo {
+pub(crate) struct ColumnInfo {
     height: i32,
     surface: Block,
     has_turf: bool,
@@ -1203,10 +1290,42 @@ impl WorldGen {
         tree_plan_from_column(seed, x, z, column).map(|(h, _)| h)
     }
 
+    /// Public: deterministic tree plan at world column, using same rules as generation.
+    pub fn tree_plan_at(&self, x: i32, z: i32) -> Option<(i32, TreeSpecies)> {
+        let column = self.column_at(x, z);
+        tree_plan_from_column(self.seed, x, z, &column)
+    }
+
+    /// Public: deterministic bush plan at world column, using same rules as generation.
+    pub fn bush_plan_at(&self, x: i32, z: i32) -> Option<(u32, i32)> {
+        let column = self.column_at(x, z);
+        if !column.supports_flora || column.cave_mouth || column.height <= SEA_LEVEL_WORLD {
+            return None;
+        }
+        let roll = hash2(self.seed ^ 0x1b87_3593, x, z);
+        if (roll & 0xffff) > column.sample.bush_threshold {
+            return None;
+        }
+        let kind = match column.sample.dominant {
+            BiomeId::Plains => 0,
+            BiomeId::Forest => {
+                if ((roll >> 18) & 1) == 0 {
+                    1
+                } else {
+                    2
+                }
+            }
+            BiomeId::Alpine => 3,
+            BiomeId::Desert => 4,
+            BiomeId::Mesa => 5,
+        };
+        Some((roll, kind))
+    }
+
     /// Keep a deterministic two-metre gap between tree centres. When two eligible
     /// columns are close, the taller tree wins and equal heights are broken by a
     /// stable hash, so the result is independent of chunk generation order.
-    fn tree_has_spacing(&self, x: i32, z: i32, trunk: i32) -> bool {
+    pub fn tree_has_spacing(&self, x: i32, z: i32, trunk: i32) -> bool {
         let own_rank = hash2(self.seed ^ 0x6a1d_2f39, x, z);
         for dz in -2..=2 {
             for dx in -2..=2 {
@@ -1419,8 +1538,8 @@ impl WorldGen {
         }
     }
 
-    fn place_broadleaf_oak(
-        data: &mut ChunkData,
+    pub fn place_broadleaf_oak<S: VegetationSink + ?Sized>(
+        data: &mut S,
         seed: u32,
         trunk_storage: IVec3,
         trunk_h: i32,
@@ -1521,7 +1640,13 @@ impl WorldGen {
         }
     }
 
-    fn place_birch(data: &mut ChunkData, seed: u32, trunk_storage: IVec3, trunk_h: i32, roll: u32) {
+    pub fn place_birch<S: VegetationSink + ?Sized>(
+        data: &mut S,
+        seed: u32,
+        trunk_storage: IVec3,
+        trunk_h: i32,
+        roll: u32,
+    ) {
         let foliage = Voxel::new(Block::Leaves).with_shape(Shape::Foliage);
         let trunk_voxel = Voxel::new(Block::Wood).with_shape(Shape::Trunk);
         let base = trunk_storage.y;
@@ -1574,7 +1699,13 @@ impl WorldGen {
         }
     }
 
-    fn place_pine(data: &mut ChunkData, seed: u32, trunk_storage: IVec3, trunk_h: i32, roll: u32) {
+    pub fn place_pine<S: VegetationSink + ?Sized>(
+        data: &mut S,
+        seed: u32,
+        trunk_storage: IVec3,
+        trunk_h: i32,
+        roll: u32,
+    ) {
         let foliage = Voxel::new(Block::Leaves).with_shape(Shape::Foliage);
         let trunk_voxel = Voxel::new(Block::Wood).with_shape(Shape::Trunk);
         let base = trunk_storage.y;
@@ -1620,8 +1751,8 @@ impl WorldGen {
         );
     }
 
-    fn place_spruce(
-        data: &mut ChunkData,
+    pub fn place_spruce<S: VegetationSink + ?Sized>(
+        data: &mut S,
         seed: u32,
         trunk_storage: IVec3,
         trunk_h: i32,
@@ -1667,8 +1798,8 @@ impl WorldGen {
         place_if_air(data, crown_origin, IVec3::new(0, trunk_h + 3, 0), foliage);
     }
 
-    fn place_hardy_shrub_tree(
-        data: &mut ChunkData,
+    pub fn place_hardy_shrub_tree<S: VegetationSink + ?Sized>(
+        data: &mut S,
         seed: u32,
         trunk_storage: IVec3,
         trunk_h: i32,
@@ -1779,10 +1910,16 @@ impl WorldGen {
         }
     }
 
-    fn place_bush_variant(data: &mut ChunkData, seed: u32, origin: IVec3, roll: u32, kind: i32) {
+    pub fn place_bush_variant<S: VegetationSink + ?Sized>(
+        data: &mut S,
+        seed: u32,
+        origin: IVec3,
+        roll: u32,
+        kind: i32,
+    ) {
         let leaf = Voxel::new(Block::Leaves).with_shape(Shape::SmallFoliage);
         let stem = Voxel::from_oriented_parts(Block::Wood, Shape::Stem, Orientation::default());
-        let place_leaf = |data: &mut ChunkData, off: IVec3| {
+        let place_leaf = |data: &mut S, off: IVec3| {
             place_if_air(data, origin, off, leaf);
         };
         match kind {

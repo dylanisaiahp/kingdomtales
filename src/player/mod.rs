@@ -411,8 +411,12 @@ fn cursor_grab(
         }
     }
 
-    if capture.grabbed && keys.just_pressed(bindings.map) && !ui.any_open() {
-        ui.open(Overlay::Map);
+    if keys.just_pressed(bindings.map) {
+        if ui.is_open(Overlay::Map) {
+            ui.close(Overlay::Map);
+        } else if capture.grabbed && !ui.any_open() {
+            ui.open(Overlay::Map);
+        }
     }
 
     if ui.any_open() {

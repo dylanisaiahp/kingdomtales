@@ -34,11 +34,11 @@ use block::{
     stem_bounds_for_shape, uses_centered_detail_bounds,
 };
 use chunk::{
-    BLOCK_SIZE, CHUNK_X, CHUNK_Y, CHUNK_Z, Chunk, ChunkData, DETAIL_Y_MAX, DETAIL_Y_MIN,
-    DETAILS_PER_WORLD_AXIS, PAD, SurfaceLayer, WORLD_CHUNK_X, WORLD_CHUNK_Y, WORLD_CHUNK_Z,
-    WORLD_PAD, WORLD_Y_MIN, chunk_origin, chunk_world_origin, detail_to_chunk, detail_to_local,
-    detail_to_world, detail_y_in_range, position_to_chunk, world_to_chunk, world_to_detail_origin,
-    world_to_local, world_voxel_cells, world_y_in_range,
+    BLOCK_SIZE, BLOCKS_PER_METRE, CHUNK_X, CHUNK_Y, CHUNK_Z, Chunk, ChunkData, DETAIL_Y_MAX,
+    DETAIL_Y_MIN, DETAILS_PER_WORLD_AXIS, PAD, SurfaceLayer, WORLD_CHUNK_X, WORLD_CHUNK_Y,
+    WORLD_CHUNK_Z, WORLD_PAD, WORLD_Y_MIN, chunk_origin, chunk_world_origin, detail_to_chunk,
+    detail_to_local, detail_to_world, detail_y_in_range, position_to_chunk, world_to_chunk,
+    world_to_detail_origin, world_to_local, world_voxel_cells, world_y_in_range,
 };
 pub use generation::MapColumn;
 use generation::WorldGen;
@@ -484,6 +484,9 @@ pub struct ChunkManager {
     pub turf_edits: HashMap<IVec3, bool>,
     /// Player changes to the natural-snow flag on world voxels, kept for saving.
     pub snow_edits: HashMap<IVec3, bool>,
+    /// Map cache invalidation hints (chunk XZ coords). Consumed by map systems.
+    pub map_dirty_terrain: HashSet<IVec2>,
+    pub map_dirty_flora: HashSet<IVec2>,
 }
 
 impl Default for ChunkManager {
@@ -507,11 +510,36 @@ impl Default for ChunkManager {
             world_edits: HashMap::new(),
             turf_edits: HashMap::new(),
             snow_edits: HashMap::new(),
+            map_dirty_terrain: HashSet::new(),
+            map_dirty_flora: HashSet::new(),
         }
     }
 }
 
 impl ChunkManager {
+    #[inline]
+    fn mark_map_dirty_for_detail(&mut self, pos: IVec3) {
+        let wx = pos.x.div_euclid(BLOCKS_PER_METRE as i32);
+        let wz = pos.z.div_euclid(BLOCKS_PER_METRE as i32);
+        let coord = IVec2::new(
+            wx.div_euclid(CHUNK_X as i32 / BLOCKS_PER_METRE as i32),
+            wz.div_euclid(CHUNK_Z as i32 / BLOCKS_PER_METRE as i32),
+        );
+        // Detail edits affect flora/overlays; terrain base usually unchanged, but be safe for structural blocks.
+        self.map_dirty_flora.insert(coord);
+        self.map_dirty_terrain.insert(coord);
+    }
+
+    #[inline]
+    fn mark_map_dirty_for_world(&mut self, pos: IVec3) {
+        let coord = IVec2::new(
+            pos.x.div_euclid(CHUNK_X as i32),
+            pos.z.div_euclid(CHUNK_Z as i32),
+        );
+        self.map_dirty_terrain.insert(coord);
+        self.map_dirty_flora.insert(coord);
+    }
+
     pub fn loaded_chunks(&self) -> usize {
         self.chunks.len()
     }
@@ -744,6 +772,7 @@ impl ChunkManager {
         if !world_y_in_range(pos.y) {
             return dirty;
         }
+        self.mark_map_dirty_for_world(pos);
 
         let center = world_to_chunk(pos);
         for dy in -1..=1 {
@@ -817,6 +846,7 @@ impl ChunkManager {
         if !world_y_in_range(pos.y) {
             return dirty;
         }
+        self.mark_map_dirty_for_world(pos);
 
         let center = world_to_chunk(pos);
         for dy in -1..=1 {
@@ -1017,6 +1047,7 @@ impl ChunkManager {
         if !detail_y_in_range(pos.y) {
             return dirty;
         }
+        self.mark_map_dirty_for_detail(pos);
 
         let center = detail_to_chunk(pos);
         for dy in -1..=1 {
@@ -2070,6 +2101,7 @@ fn stream_chunks(
         .collect();
     for coord in stale {
         if let Some(chunk) = manager.chunks.remove(&coord) {
+            manager.map_dirty_flora.insert(IVec2::new(coord.x, coord.z));
             commands.entity(chunk.entity).despawn();
             if let Some(h) = manager.opaque_fade_materials.remove(&coord) {
                 materials.remove(&h);
@@ -2535,6 +2567,7 @@ fn spawn_chunk(
         water_entity = Some(child);
     }
 
+    manager.map_dirty_flora.insert(IVec2::new(coord.x, coord.z));
     manager.chunks.insert(
         coord,
         Chunk {
