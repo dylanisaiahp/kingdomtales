@@ -44,9 +44,7 @@ work.
 
 ## 3. Map system
 
-The map is not implemented yet. The M binding and `Overlay::Map` are reserved
-placeholders shown in the UI, but no system currently opens a map or handles M.
-The intended feature has two modes:
+The map is implemented with Live 3D and Explore 2D modes (see `FEATURES.md`). Remaining work:
 
 - **3D map:** an overhead live view of loaded chunks with a dedicated map
   camera, player position/orientation, and optional zoom, rotation and camera

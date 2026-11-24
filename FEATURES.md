@@ -7,16 +7,14 @@ lives in `ROADMAP.md` and should not be duplicated here.
 
 ## 0. Project state
 
-- Version: `0.0.1-indev` in `Cargo.toml`.
+- Version: `0.0.2` in `Cargo.toml`.
 - Bevy `0.20.1`, features `3d` + `ui`.
-- Rust source: ~34k lines across `src/` (see `wc -l src/*.rs src/**/*.rs`).
-- All work is uncommitted. Do not commit until the version is bumped past
-  `0.0.1-indev`.
+- Rust source: ~40k lines across `src/` (see `wc -l src/*.rs src/**/*.rs`).
 - Last verified baseline: `cargo fmt --all --check`,
-  `cargo check --all-targets`, `cargo clippy --all-targets` (pre-existing
-  `clippy::too_many_arguments` warnings only), and `cargo test --all-targets`
-  (**322 passed, 0 failed, 4 ignored**). No in-game/runtime smoke verification
-  was performed in this pass.
+  `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test --all-targets` (**329 passed, 0 failed, 4 ignored**), and
+  `cargo build`. No in-game/runtime smoke verification was performed in this
+  pass.
 
 ## 1. Game identity and settled decisions
 
@@ -53,8 +51,7 @@ These decisions are settled and should not be reintroduced:
     with a deterministic ~5% chance to yield one stick on decay.
 11. **UI source stays ASCII-only.** Docs and tests stay in sync with behavior.
 12. **Unrelated systems keep working:** mining, natural surface layers, geology,
-    settings, off-hand trinkets and voxel persistence. The map is still a
-    roadmap feature.
+    settings, off-hand trinkets and voxel persistence.
 13. **The hammer shape menu is vertical.** It is a compact presentation panel,
     not a radial tool wheel; tool selection still happens through hotbar slots.
 14. **No health or injury mechanics.** Survival is stamina, hunger and hydration
@@ -64,8 +61,11 @@ These decisions are settled and should not be reintroduced:
     plus one perk point. Perk points buy larger scaling bonuses in level bands.
 16. **Economy and notification values are data-driven.** Pickup XP/coins live in
     `PICKUP_REWARDS`; transient HUD rows come from `NotificationFeed`.
-17. **The map is reserved, not implemented.** `Overlay::Map`, the M binding and
-    menu/hint placeholders exist, but no map systems or screens open them.
+17. **The map has live 3D and Explore 2D modes.** `M` toggles the map overlay,
+    which renders a north-up 3D live view or a 2D Explore view with pan/zoom,
+    recenter, player marker, fog-of-war visibility, and persisted explored cells.
+    Exploration accumulates while the map is closed; Explore rendering/snapshot
+    work is gated to the map being open.
 18. **LODs are deliberately last.** Occlusion culling remains unimplemented;
     performance work so far is exposed-face culling, frustum culling, stream
     priority and foliage shadow handling.
@@ -344,7 +344,27 @@ These decisions are settled and should not be reintroduced:
   keeps its fixed direction and colour in every preset. The player camera uses
   2x MSAA instead of 4x to reduce fill cost on dense voxel silhouettes.
 
-## 3. Player and world interaction
+## 3. Map system
+
+Press `M` to toggle the map overlay (`Overlay::Map`). The map has two modes:
+
+- **Live 3D:** north-up overhead view rendered by a dedicated `MapCamera` into an
+  offscreen texture shown in the map UI. It uses loaded world/chunk rendering and
+  focuses on the player's current world position/height when opened or recentered.
+- **Explore 2D:** CPU-composited north-up top-down image of explored terrain,
+  with pan, zoom, recenter (`C`/`Home`), player marker/facing, and mode tabs.
+
+Fog-of-war in Explore is binary: unexplored cells are transparent/hidden;
+explored cells show terrain. Exploration is tracked in 4 m grid cells, updated
+from player position (discover/visible radii), accumulated while the map is
+closed, and persisted in save v2 `map_explored x z` records. Save validation
+rejects invalid map exploration data before mutating live state.
+
+Explore snapshots use budgeted chunk builds, terrain/flora cache entries keyed
+by chunk, and dirty invalidation hints from world edits. Snapshot/render/build
+work is gated to the map being open.
+
+## 4. Player and world interaction
 
 - Gameplay is first-person and non-combat. WASD moves, Space jumps (holding
   continues hopping), Shift sprints with stamina, and Ctrl crouches. In shallow
@@ -373,7 +393,7 @@ These decisions are settled and should not be reintroduced:
   hand-gatherable; they are not block harvesting. The hammer reserves RMB for
   its shape menu.
 
-## 4. Items, inventory and storage
+## 5. Items, inventory and storage
 
 - All carryable items are defined in one compiled table, `ItemId` / `ITEM_DEFS`.
   A test keeps the enum and table aligned. `Lantern` and `Magnet` are real
@@ -421,7 +441,7 @@ These decisions are settled and should not be reintroduced:
   This prevents unloaded chunks from being treated as solid and pushing the
   player upward.
 
-## 5. Progression, survival and HUD
+## 6. Progression, survival and HUD
 
 - `Progression` is the authoritative resource for level, XP, coins, perk points,
   perk bonuses and hunger/hydration. The HUD only reads it; it does not keep
@@ -521,7 +541,7 @@ nearest-filtered RGBA textures and drawn with `ImageNode`; no external art
 assets are loaded. The settings screen is a fixed full-window translucent panel,
 so changing tabs never resizes the menu.
 
-## 6. Tools, building and off-hand
+## 7. Tools, building and off-hand
 
 ### Tools
 
@@ -578,7 +598,7 @@ so changing tabs never resizes the menu.
 - Neither trinket consumes a hotbar slot, and neither changes mining, building
   or combat rules (the game has no combat).
 
-## 7. Drops and felling
+## 8. Drops and felling
 
 ### Item drops
 
@@ -615,7 +635,7 @@ so changing tabs never resizes the menu.
   pieces created.
 - Releasing a mining swing before the trunk breaks leaves the whole tree intact.
 
-## 8. Persistence and settings
+## 9. Persistence and settings
 
 - Saves use line-based ASCII with a `KT_SAVE 2` header.
 - The save stores the hotbar, backpack contents, capacity, category unlocks,
@@ -655,7 +675,7 @@ so changing tabs never resizes the menu.
   the settings menu shows a note on Wayland. A windowed session can exceed the
   refresh rate.
 
-## 9. Controls
+## 10. Controls
 
 Implemented defaults (gameplay keys live in `InputBindings`):
 
@@ -692,7 +712,7 @@ Implemented defaults (gameplay keys live in `InputBindings`):
 - **H:** Controls help. Opening any modal overlay, including the pause menu,
   closes it.
 
-## 10. Engineering conventions
+## 11. Engineering conventions
 
 - Prefer owned data and `Copy` IDs: `ItemId`, `Block`, `Shape`, `Orientation`,
   `Entity` and integer indices. Avoid reference fields and explicit lifetimes.
@@ -707,7 +727,7 @@ Implemented defaults (gameplay keys live in `InputBindings`):
 - Keep module APIs small: UI never owns game state, and game state never
   imports UI.
 
-## 11. Gotchas
+## 12. Gotchas
 
 - `BLOCK_SIZE = 0.5` detail cell; world voxels are 1 m; 8 detail cells per
   world voxel. `PANEL_HEIGHT = 0.2` detail units, i.e. 0.1 m.
@@ -745,7 +765,7 @@ Implemented defaults (gameplay keys live in `InputBindings`):
 - Drop and leaf support must go through the surface-aware check so small objects
   stay visible and pickable on grass and snow.
 
-## 12. Verification
+## 13. Verification
 
 Run these before calling a change complete:
 

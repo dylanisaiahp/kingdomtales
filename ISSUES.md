@@ -8,7 +8,7 @@
 - `cargo fmt --all --check`: pass
 - `cargo check --all-targets`: pass
 - `cargo clippy --all-targets`: pass (pre-existing `clippy::too_many_arguments` warnings only)
-- `cargo test --all-targets`: pass (**322 passed, 0 failed, 4 ignored**)
+- `cargo test --all-targets`: pass (**329 passed, 0 failed, 4 ignored**)
 
 ## Explicitly Deferred
 - Tree/bush/limb/root placement and root-size/selection-box alignment.

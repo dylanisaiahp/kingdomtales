@@ -103,6 +103,7 @@ pub struct MapState {
     pub target_open: bool,
     pub open_amount: f32,
     pub center_xz: Vec2,
+    pub focus_y: f32,
     pub zoom: f32,
     pub dragging: bool,
     pub last_cursor: Option<Vec2>,
@@ -131,7 +132,8 @@ impl Default for MapState {
             target_open: false,
             open_amount: 0.0,
             center_xz: Vec2::ZERO,
-            zoom: 1.0,
+            focus_y: 0.0,
+            zoom: DEFAULT_ZOOM,
             dragging: false,
             last_cursor: None,
             last_fog_center: Vec2::ZERO,
@@ -1260,6 +1262,7 @@ fn sync_map_target(
         if open {
             if let Ok(p) = player.single() {
                 state.center_xz = Vec2::new(p.translation.x, p.translation.z);
+                state.focus_y = p.translation.y;
                 state.initialized = true;
             }
             // Snap map camera immediately on open to avoid one-frame stale/cave view.
@@ -1267,7 +1270,7 @@ fn sync_map_target(
                 let active_3d = state.mode == MapMode::Overhead3D;
                 cam.is_active = active_3d;
                 if active_3d {
-                    let center = Vec3::new(state.center_xz.x, 0.0, state.center_xz.y);
+                    let center = Vec3::new(state.center_xz.x, state.focus_y, state.center_xz.y);
                     *transform = Transform::from_translation(center + Vec3::Y * state.zoom)
                         .looking_at(center, Vec3::NEG_Z);
                     if let Projection::Perspective(p) = &mut *projection {
@@ -1799,6 +1802,7 @@ fn handle_map_zoom(
         && let Ok(p) = player.single()
     {
         state.center_xz = Vec2::new(p.translation.x, p.translation.z);
+        state.focus_y = p.translation.y;
     }
     let Some(scroll) = scroll else { return };
     if scroll.delta.y.abs() < f32::EPSILON {
@@ -1825,7 +1829,7 @@ fn update_map_camera(
         return;
     }
 
-    let center = Vec3::new(state.center_xz.x, 0.0, state.center_xz.y);
+    let center = Vec3::new(state.center_xz.x, state.focus_y, state.center_xz.y);
     let pos = center + Vec3::Y * state.zoom;
     *transform = Transform::from_translation(pos).looking_at(center, Vec3::NEG_Z);
 
