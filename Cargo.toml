@@ -1,11 +1,14 @@
 [package]
 name = "KingdomTales"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2024"
+default-run = "KingdomTales"
 
 [dependencies]
-bevy = { version = "0.20.1", default-features = false, features = ["3d", "ui", "ui_picking"] }
+bevy = { version = "0.20.1", default-features = false, features = ["3d", "ui", "ui_picking", "png", "bevy_gltf"] }
+naga = "30.0.2"
 noise = "0.9"
+wesl = "0.6.0"
 
 # Keep debug builds playable: our code stays fast to compile, dependencies are optimized.
 [profile.dev]

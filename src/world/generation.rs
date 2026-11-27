@@ -496,82 +496,14 @@ pub struct MapColumn {
     pub biome: BiomeId,
     pub forest: f32,
     pub supports_flora: bool,
-    #[allow(dead_code)]
     pub flora: MapFloraKind,
 }
 
-/// Public map/helper: deterministic bush kind for a column and roll, matching `place_bushes`.
-#[allow(dead_code)]
-pub fn bush_kind_for_column(column: &MapColumn, roll: u32) -> i32 {
-    match column.biome {
-        BiomeId::Plains => 0,
-        BiomeId::Forest => {
-            if ((roll >> 18) & 1) == 0 {
-                1
-            } else {
-                2
-            }
-        }
-        BiomeId::Alpine => 3,
-        BiomeId::Desert => 4,
-        BiomeId::Mesa => 5,
-    }
-}
-
-/// Public map/helper: should a bush be placed at this column? Uses same deterministic rule.
-#[allow(dead_code)]
-pub fn bush_plan_for_column(seed: u32, x: i32, z: i32, column: &MapColumn) -> Option<(u32, i32)> {
-    if !column.supports_flora || column.height <= SEA_LEVEL_WORLD {
-        return None;
-    }
-    let roll = hash2(seed ^ 0x1b87_3593, x, z);
-    // bush_threshold is encoded in sample; MapColumn doesn't carry it. Caller should check with map_flora_at logic? Better expose threshold via column_at sample.
-    // For now, use map_flora_at/bush decision through column: caller has MapColumn.flora.
-    if column.flora != MapFloraKind::Bush {
-        return None;
-    }
-    Some((roll, bush_kind_for_column(column, roll)))
-}
-
-/// Public map/helper: deterministic bush plan for a map column. Uses same MapColumn flora decision.
-#[allow(dead_code)]
-pub fn bush_plan_for_map_column(
-    seed: u32,
-    x: i32,
-    z: i32,
-    column: &MapColumn,
-) -> Option<(u32, i32)> {
-    if column.flora != MapFloraKind::Bush
-        || !column.supports_flora
-        || column.height <= SEA_LEVEL_WORLD
-    {
-        return None;
-    }
-    let roll = hash2(seed ^ 0x1b87_3593, x, z);
-    Some((roll, bush_kind_for_column(column, roll)))
-}
 impl WorldGen {
+    /// Test-only seed accessor used by map projection tests.
     #[allow(dead_code)]
     pub fn seed(&self) -> u32 {
         self.seed
-    }
-
-    /// Deterministic flora marker for map rendering. Uses same rules as worldgen placement checks
-    /// (density/hash/biome), without chunk-local occupancy.
-    #[allow(dead_code)]
-    pub fn map_flora_at(&self, x: i32, z: i32) -> MapFloraKind {
-        let column = self.column_at(x, z);
-        if !column.supports_flora || column.cave_mouth || column.height <= SEA_LEVEL_WORLD {
-            return MapFloraKind::None;
-        }
-        if tree_plan_from_column(self.seed, x, z, &column).is_some() {
-            return MapFloraKind::Tree;
-        }
-        let roll = hash2(self.seed ^ 0x1b87_3593, x, z);
-        if (roll & 0xffff) <= column.sample.bush_threshold {
-            return MapFloraKind::Bush;
-        }
-        MapFloraKind::None
     }
 }
 
@@ -1372,6 +1304,7 @@ impl WorldGen {
                 let wx = origin_world.x + px as i32 - WORLD_PAD as i32;
                 let wz = origin_world.z + pz as i32 - WORLD_PAD as i32;
                 let column = &columns[pz * WORLD_PADDED_X + px];
+                data.world_heights[pz * WORLD_PADDED_X + px] = column.height;
                 for py in 0..WORLD_PADDED_Y {
                     let wy = origin_world.y + py as i32 - WORLD_PAD as i32;
                     let block = self.world_block_from_column(wx, wy, wz, column);
@@ -2802,6 +2735,19 @@ mod tests {
         assert_eq!(block, generator.world_block_at(4, height, 4));
         assert!(block.is_solid(), "land at its surface should be solid");
         assert_ne!(block, Block::Bedrock);
+    }
+
+    #[test]
+    fn generated_chunk_caches_column_heights_for_seabed_depth() {
+        let generator = WorldGen::new(42);
+        let data = generator.generate_chunk(IVec3::ZERO);
+        for (x, z) in [(-1, 0), (0, 0), (8, 15), (15, 8), (16, 0)] {
+            assert_eq!(
+                data.world_height_local(x, z),
+                generator.height_at(x, z),
+                "cached height diverged at ({x}, {z})"
+            );
+        }
     }
 
     #[test]

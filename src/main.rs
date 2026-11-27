@@ -1,35 +1,37 @@
 //! KingdomTales - a peaceful voxel kingdom builder.
 //!
-//! Milestone 1: a walkable, editable procedural voxel world.
+//! Core loop: a walkable, editable procedural voxel world.
 //!
 //! Controls
 //! --------
 //! WASD move, Space jump (hold to keep hopping), Shift sprint (uses stamina),
 //! Ctrl crouch, 1-8 select a hotbar slot, mouse wheel cycles slots. LMB mines
-//! with a tool, places a block from inventory, applies the selected hammer shape,
-//! or rotates with the wrench. Holding RMB with the hammer opens the shape menu;
-//! otherwise RMB gathers loose clutter and picks up drops. Breaking a trunk
-//! fells the tree into immediate wood drops and individual falling leaves.
-//! Backpack attachment slots (in the character panel) hold physical utility
-//! items such as Lantern or Magnet and keep their effects active while attached.
-//! Tab opens the backpack (inventory, hands crafting, and attachments), M opens
-//! the overhead map, Enter opens chat and commands, Esc opens the
-//! pause menu (settings, character perks and reserved map/debug options), F3
-//! toggles the debug overlay, F9 saves, F10 loads, F12 saves a screenshot and H
-//! shows controls help. The HUD shows level/XP, coins, compass, stamina,
-//! hunger/hydration, Insight and pickup notifications. A white outline marks the
-//! block under the crosshair.
+//! with a tool, applies the selected hammer shape, or rotates with the wrench.
+//! RMB places the selected block or structure, interacts, gathers loose clutter,
+//! picks up drops, or holds the hammer shape menu. Breaking a trunk fells the
+//! tree into immediate wood drops and individual falling leaves. Backpack
+//! attachment slots (in the character panel) hold physical utility items such as
+//! Lantern or Magnet and keep their effects active while attached. Tab opens the
+//! backpack (inventory, hand crafting, and attachments), M opens the overhead
+//! map, Enter opens chat and commands, Esc opens the pause menu (Resume,
+//! Settings, Quit), F3 toggles the debug overlay, F9 saves, F10 loads, F12 saves
+//! a screenshot and H shows controls help. The HUD shows level/XP, coins,
+//! compass, stamina, hunger/hydration, Insight and pickup notifications. A white
+//! outline marks the block under the crosshair.
 
 mod attachments;
 mod backpack;
 mod chat;
+mod clouds;
 mod construction;
 mod crafting;
+mod day_night;
 mod felling;
 mod held_item;
 mod insight;
 mod interaction;
 mod items;
+mod light_shafts;
 mod map;
 mod notifications;
 mod persistence;
@@ -46,44 +48,46 @@ mod ui;
 mod ui_manager;
 mod world;
 
+use bevy::gltf::GltfPlugin;
+use bevy::image::{ImagePlugin, ImageSamplerDescriptor};
 use bevy::light::CascadeShadowConfig;
 use bevy::prelude::*;
 use bevy::window::{MonitorSelection, PresentMode, WindowMode, WindowResolution};
 
-use settings::{GameSettings, SunLight};
+use settings::{GameSettings, MoonLight, SunLight, surface_preset_for_cycle};
 
 fn main() {
     App::new()
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "KingdomTales".into(),
-                resolution: WindowResolution::new(
-                    settings::WINDOWED_WIDTH,
-                    settings::WINDOWED_HEIGHT,
-                ),
-                mode: WindowMode::BorderlessFullscreen(MonitorSelection::Primary),
-                present_mode: PresentMode::AutoNoVsync,
-                resizable: true,
-                ..default()
-            }),
-            ..default()
-        }))
-        .insert_resource(ClearColor(Color::srgb(
-            settings::SURFACE_FOG_COLOR[0],
-            settings::SURFACE_FOG_COLOR[1],
-            settings::SURFACE_FOG_COLOR[2],
-        )))
-        .insert_resource(GlobalAmbientLight {
-            color: Color::srgb(
-                settings::SURFACE_AMBIENT_COLOR[0],
-                settings::SURFACE_AMBIENT_COLOR[1],
-                settings::SURFACE_AMBIENT_COLOR[2],
-            ),
-            brightness: settings::SURFACE_AMBIENT_BRIGHTNESS,
-            ..default()
-        })
+        .add_plugins(
+            DefaultPlugins
+                .set(WindowPlugin {
+                    primary_window: Some(Window {
+                        title: "KingdomTales".into(),
+                        resolution: WindowResolution::new(
+                            settings::WINDOWED_WIDTH,
+                            settings::WINDOWED_HEIGHT,
+                        ),
+                        mode: WindowMode::BorderlessFullscreen(MonitorSelection::Primary),
+                        present_mode: PresentMode::AutoNoVsync,
+                        resizable: true,
+                        ..default()
+                    }),
+                    ..default()
+                })
+                .set(ImagePlugin::default_nearest())
+                .set(GltfPlugin {
+                    default_sampler: ImageSamplerDescriptor::nearest(),
+                    ..default()
+                }),
+        )
+        .insert_resource(ClearColor(Color::srgb(0.55, 0.72, 0.88)))
+        .insert_resource(GlobalAmbientLight::default())
         .add_plugins((
             ui_manager::UiManagerPlugin,
+            day_night::DayNightPlugin,
+            sky::SkyPlugin,
+            light_shafts::LightShaftsPlugin,
+            clouds::CloudsPlugin,
             settings::SettingsPlugin,
             items::ItemsPlugin,
             progression::ProgressionPlugin,
@@ -111,21 +115,46 @@ fn main() {
         .run();
 }
 
-fn setup_lighting(mut commands: Commands, settings: Res<GameSettings>) {
-    let mut light = DirectionalLight {
-        color: Color::srgb(1.0, 0.97, 0.90),
-        illuminance: settings::SURFACE_SUN_ILLUMINANCE,
-        shadow_maps_enabled: true,
+fn setup_lighting(
+    mut commands: Commands,
+    settings: Res<GameSettings>,
+    cycle: Res<day_night::DayNightCycle>,
+) {
+    let preset = surface_preset_for_cycle(&cycle);
+    let mut sun = DirectionalLight {
+        color: Color::srgb(
+            preset.sun_color[0],
+            preset.sun_color[1],
+            preset.sun_color[2],
+        ),
+        illuminance: preset.sun_illuminance,
+        shadow_maps_enabled: settings.shadow_quality != settings::ShadowQuality::Off,
         ..default()
     };
     let mut cascades = CascadeShadowConfig::default();
-    settings::apply_shadow_quality(&mut light, &mut cascades, settings.shadow_quality);
+    settings::apply_shadow_quality(&mut sun, &mut cascades, settings.shadow_quality);
 
     commands.spawn((
         Name::new("Sun"),
         SunLight,
-        light,
-        Transform::from_rotation(Quat::from_rotation_y(-0.62) * Quat::from_rotation_x(-0.85)),
+        sun,
+        Transform::from_translation(Vec3::ZERO).looking_to(cycle.sun_direction(), Vec3::Y),
         cascades,
+    ));
+
+    commands.spawn((
+        Name::new("Moon"),
+        MoonLight,
+        DirectionalLight {
+            color: Color::srgb(
+                preset.moon_color[0],
+                preset.moon_color[1],
+                preset.moon_color[2],
+            ),
+            illuminance: preset.moon_illuminance,
+            shadow_maps_enabled: false,
+            ..default()
+        },
+        Transform::from_translation(Vec3::ZERO).looking_to(cycle.moon_direction(), Vec3::Y),
     ));
 }

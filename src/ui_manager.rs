@@ -1,11 +1,10 @@
 //! Centralised overlay state.
 //!
-//! Every modal panel (pause menu, settings, chat, hammer shape menu and
-//! backpack) goes
-//! through one [`UiManager`]. Systems ask the manager whether an overlay is open
-//! instead of stitching together a chain of `menu.open || chat.open || ...`
-//! checks. Only one overlay can be active at a time, which also makes Escape and
-//! cursor handling deterministic.
+//! Every modal panel (pause menu, settings, chat, map, hammer shape menu,
+//! backpack and `/give` picker) goes through one [`UiManager`]. Systems ask the
+//! manager whether an overlay is open instead of stitching together a chain of
+//! `menu.open || chat.open || ...` checks. Only one overlay can be active at a
+//! time, which also makes Escape and cursor handling deterministic.
 
 use bevy::prelude::*;
 
@@ -20,7 +19,8 @@ pub enum Overlay {
     Backpack,
     /// Creative item picker opened by `/give` with no args.
     GiveMenu,
-    /// Overhead 3D map (Phase 1). Phase 2 adds persistence/fog of war.
+    /// Overhead map with Live 3D and Explore 2D modes; explored cells persist
+    /// via save records.
     Map,
 }
 

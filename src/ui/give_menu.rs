@@ -13,6 +13,7 @@ use bevy::ui_widgets::{Activate, Button};
 use super::theme::{UiTheme, display_if, spawn_panel, spawn_text};
 use crate::backpack::Backpack;
 use crate::items::{ItemId, store_item};
+use crate::notifications::NotificationFeed;
 use crate::pockets::Pockets;
 use crate::ui::icons::UiIcons;
 use crate::ui_manager::{Overlay, UiManager};
@@ -391,20 +392,25 @@ fn on_give_row_activate(
     mut pockets: ResMut<Pockets>,
     mut backpack: ResMut<Backpack>,
     mut chat: ResMut<crate::chat::ChatState>,
+    mut notifications: ResMut<NotificationFeed>,
     theme: Res<UiTheme>,
 ) {
     let Ok(row) = rows.get(activate.entity) else {
         return;
     };
     let item = row.0;
-    let leftover = store_item(&mut pockets, &mut backpack, item, 1);
-    if leftover == 0 {
+    let count = item.def().max_stack.max(1);
+    let leftover = store_item(&mut pockets, &mut backpack, item, count);
+    let given = count - leftover;
+    if given > 0 {
+        notifications.push_item(item, given);
         crate::chat::push_message(
             &mut chat,
-            format!("Gave {} x1", item.display_name()),
+            format!("Gave {} x{}", item.display_name(), given),
             theme.colors.text,
         );
-    } else {
+    }
+    if leftover > 0 {
         crate::chat::push_message(
             &mut chat,
             "Pockets and backpack are full.",

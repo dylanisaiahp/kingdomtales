@@ -198,12 +198,10 @@ impl Progression {
         self.hydration
     }
 
-    #[allow(dead_code)]
     pub fn hunger_fraction(&self) -> f32 {
         fraction(self.hunger, self.max(Attribute::Hunger))
     }
 
-    #[allow(dead_code)]
     pub fn hydration_fraction(&self) -> f32 {
         fraction(self.hydration, self.max(Attribute::Hydration))
     }
@@ -329,7 +327,6 @@ impl Progression {
 }
 
 #[inline]
-#[allow(dead_code)]
 fn fraction(current: f32, max: f32) -> f32 {
     if max <= 0.0 {
         0.0

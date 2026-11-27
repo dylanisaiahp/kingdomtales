@@ -1,5 +1,6 @@
 //! First-person player controller with voxel AABB collision and block editing.
 
+use bevy::camera::visibility::RenderLayers;
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
 use bevy::light::ShadowFilteringMethod;
 use bevy::prelude::*;
@@ -9,7 +10,8 @@ use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 use crate::chat::ChatState;
 use crate::crafting::CraftingUiState;
 use crate::pockets::Pockets;
-use crate::settings::{GameSettings, InputBindings, MenuState, SURFACE_FOG_COLOR};
+use crate::settings::{GameSettings, InputBindings, KeybindCapture, MenuState, SURFACE_FOG_COLOR};
+use crate::sky::SKY_RENDER_LAYER;
 use crate::structures::Structures;
 use crate::ui_manager::{Overlay, UiManager};
 use crate::world::block::{Block, Voxel};
@@ -254,7 +256,7 @@ impl Plugin for PlayerPlugin {
     }
 }
 
-fn spawn_player(mut commands: Commands, spawn: Res<SpawnPoint>, mut images: ResMut<Assets<Image>>) {
+fn spawn_player(mut commands: Commands, spawn: Res<SpawnPoint>) {
     let player = commands
         .spawn((
             Player {
@@ -273,11 +275,14 @@ fn spawn_player(mut commands: Commands, spawn: Res<SpawnPoint>, mut images: ResM
         ))
         .id();
 
-    let sky_image = images.add(crate::sky::create_sky_image());
     commands.spawn((
         PlayerCamera,
         Camera3d::default(),
-        crate::sky::create_skybox(sky_image),
+        // The main camera sees the shared world layer plus the dedicated sky layer.
+        RenderLayers::layer(0).with(SKY_RENDER_LAYER),
+        bevy::camera::Hdr,
+        bevy::render::view::Tonemapping::TonyMcMapface,
+        bevy::render::view::ColorGrading::default(),
         Projection::Perspective(PerspectiveProjection {
             fov: 90f32.to_radians(),
             near: 0.05 * BLOCKS_PER_METRE,
@@ -300,6 +305,19 @@ fn spawn_player(mut commands: Commands, spawn: Res<SpawnPoint>, mut images: ResM
         },
         ShadowFilteringMethod::Gaussian,
         Msaa::Sample2,
+        // Default bloom (Low). Updated at runtime by settings.
+        bevy::post_process::bloom::Bloom {
+            intensity: 0.08,
+            low_frequency_boost: 0.35,
+            low_frequency_boost_curvature: 0.7,
+            high_pass_frequency: 1.0,
+            prefilter: bevy::post_process::bloom::BloomPrefilter {
+                threshold: 1.0,
+                threshold_softness: 0.4,
+            },
+            composite_mode: bevy::post_process::bloom::BloomCompositeMode::EnergyConserving,
+            ..bevy::post_process::bloom::Bloom::NATURAL
+        },
         ChildOf(player),
     ));
 }
@@ -325,9 +343,14 @@ fn cursor_grab(
     mut crafting: ResMut<CraftingUiState>,
     mut ui: ResMut<UiManager>,
     bindings: Res<InputBindings>,
+    capture_binding: Res<KeybindCapture>,
     initial_load: Res<crate::world::InitialWorldLoad>,
 ) {
     capture.just_grabbed = false;
+
+    // While the Keybinds tab is waiting for a key, gameplay hotkeys must not
+    // fire. The settings menu consumes the pressed key and Esc cancels capture.
+    let rebinding = capture_binding.0.is_some();
 
     let Ok(mut cursor) = cursor_query.single_mut() else {
         capture.grabbed = false;
@@ -369,7 +392,7 @@ fn cursor_grab(
     // Escape closes the most recently opened overlay before it opens the pause
     // menu. Modal panels are dismissed here so their own input systems do not
     // duplicate cursor handling.
-    if keys.just_pressed(bindings.pause) {
+    if !rebinding && keys.just_pressed(bindings.pause) {
         match ui.active() {
             Some(Overlay::Menu) => {
                 ui.close(Overlay::Menu);
@@ -400,7 +423,7 @@ fn cursor_grab(
         }
     }
 
-    if keys.just_pressed(bindings.backpack) {
+    if !rebinding && keys.just_pressed(bindings.backpack) {
         if ui.is_open(Overlay::Backpack) {
             ui.close(Overlay::Backpack);
             crafting.station = None;
@@ -411,7 +434,7 @@ fn cursor_grab(
         }
     }
 
-    if keys.just_pressed(bindings.map) {
+    if !rebinding && keys.just_pressed(bindings.map) {
         if ui.is_open(Overlay::Map) {
             ui.close(Overlay::Map);
         } else if capture.grabbed && !ui.any_open() {
@@ -1416,7 +1439,6 @@ mod tests {
             triangles: 0,
             water_triangles: 0,
             foliage_triangles: 0,
-            fade_remaining: 0.0,
         }
     }
 

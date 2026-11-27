@@ -8,12 +8,15 @@
 //! The log is taller than the old HUD chat, has a scrollbar, and keeps a
 //! runtime-only command/message history that can be browsed with Up/Down.
 
+use bevy::ecs::system::SystemParam;
 use bevy::input::mouse::AccumulatedMouseScroll;
 use bevy::input::{ButtonState, keyboard::KeyboardInput};
 use bevy::prelude::*;
 
 use crate::backpack::Backpack;
+use crate::day_night::DayNightCycle;
 use crate::items::{ItemCategory, ItemId, store_item};
+use crate::notifications::NotificationFeed;
 use crate::player::{CursorCapture, Player};
 use crate::pockets::Pockets;
 use crate::settings::InputBindings;
@@ -32,6 +35,18 @@ const LOG_HEIGHT: f32 = 260.0;
 pub struct ChatMessage {
     pub text: String,
     pub color: Color,
+}
+
+#[derive(SystemParam)]
+struct ChatCmdCtx<'w> {
+    pockets: ResMut<'w, Pockets>,
+    backpack: ResMut<'w, Backpack>,
+    notifications: ResMut<'w, NotificationFeed>,
+    generator: Res<'w, WorldGenResource>,
+    spawn: Res<'w, SpawnPoint>,
+    pending_teleport: ResMut<'w, PendingTeleport>,
+    day_night: ResMut<'w, DayNightCycle>,
+    movement_mode: ResMut<'w, crate::player::MovementMode>,
 }
 
 #[derive(Resource)]
@@ -156,8 +171,7 @@ impl Plugin for ChatPlugin {
                     render_chat_log,
                     update_scrollbar,
                 )
-                    .chain()
-                    .in_set(ChatUiSystems),
+                    .chain(),
             );
     }
 }
@@ -310,12 +324,7 @@ fn chat_input(
     capture: Res<CursorCapture>,
     bindings: Res<InputBindings>,
     theme: Res<UiTheme>,
-    mut pockets: ResMut<Pockets>,
-    mut backpack: ResMut<Backpack>,
-    generator: Res<WorldGenResource>,
-    spawn: Res<SpawnPoint>,
-    mut pending_teleport: ResMut<PendingTeleport>,
-    mut movement_mode: ResMut<crate::player::MovementMode>,
+    mut cmd: ChatCmdCtx,
     mut player: Query<(&mut Transform, &mut Player)>,
 ) {
     let dt = time.delta_secs().min(0.05);
@@ -393,37 +402,18 @@ fn chat_input(
         chat.remember(&line);
 
         let player_data = player.single_mut().ok();
-        let movement = Some(&mut *movement_mode);
-        send_chat(
-            &theme,
-            &mut chat,
-            &mut ui,
-            &mut pockets,
-            &mut backpack,
-            &generator,
-            &spawn,
-            &mut pending_teleport,
-            player_data,
-            movement,
-            &line,
-        );
+        send_chat(&theme, &mut chat, &mut ui, &mut cmd, player_data, &line);
     }
 }
 
 type PlayerData<'a> = (Mut<'a, Transform>, Mut<'a, Player>);
 
-#[allow(clippy::too_many_arguments)]
 fn send_chat(
     theme: &UiTheme,
     chat: &mut ChatState,
     ui: &mut UiManager,
-    pockets: &mut Pockets,
-    backpack: &mut Backpack,
-    generator: &WorldGenResource,
-    spawn: &SpawnPoint,
-    pending_teleport: &mut PendingTeleport,
+    cmd: &mut ChatCmdCtx,
     player: Option<PlayerData>,
-    movement: Option<&mut crate::player::MovementMode>,
     line: &str,
 ) {
     let line = line.trim();
@@ -432,36 +422,18 @@ fn send_chat(
     }
 
     if let Some(command) = line.strip_prefix('/') {
-        execute_command(
-            theme,
-            chat,
-            ui,
-            pockets,
-            backpack,
-            generator,
-            spawn,
-            pending_teleport,
-            player,
-            movement,
-            command,
-        );
+        execute_command(theme, chat, ui, cmd, player, command);
     } else {
         push_message(chat, format!("You: {line}"), theme.colors.text);
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn execute_command(
     theme: &UiTheme,
     chat: &mut ChatState,
     ui: &mut UiManager,
-    pockets: &mut Pockets,
-    backpack: &mut Backpack,
-    generator: &WorldGenResource,
-    spawn: &SpawnPoint,
-    pending_teleport: &mut PendingTeleport,
+    cmd: &mut ChatCmdCtx,
     mut player: Option<PlayerData>,
-    movement: Option<&mut crate::player::MovementMode>,
     command: &str,
 ) {
     let mut parts = command.split_whitespace();
@@ -518,6 +490,23 @@ fn execute_command(
                 "/pos - show your position (metres)",
                 theme.colors.accent,
             );
+            push_message(
+                chat,
+                "/time set <day|noon|sunset|night|midnight|ticks>",
+                theme.colors.accent,
+            );
+            push_message(chat, "/time add <ticks>", theme.colors.accent);
+            push_message(
+                chat,
+                "/time query <daytime|gametime|day>",
+                theme.colors.accent,
+            );
+            push_message(
+                chat,
+                "/time speed <multiplier> - day/night speed only",
+                theme.colors.accent,
+            );
+            push_message(chat, "/time cycle <true|false>", theme.colors.accent);
         }
         "give" => {
             if rest.is_empty() {
@@ -550,9 +539,10 @@ fn execute_command(
                 return;
             }
 
-            let leftover = store_item(pockets, backpack, item, count);
+            let leftover = store_item(&mut cmd.pockets, &mut cmd.backpack, item, count);
             let given = count - leftover;
             if given > 0 {
+                cmd.notifications.push_item(item, given);
                 push_message(
                     chat,
                     format!("Gave {} x{}", item.display_name(), given),
@@ -564,16 +554,16 @@ fn execute_command(
             }
         }
         "clear" => {
-            pockets.clear();
-            backpack.clear();
+            cmd.pockets.clear();
+            cmd.backpack.clear();
             push_message(chat, "Pockets and backpack cleared.", theme.colors.text);
         }
         "upgrade" => match rest.first().map(|value| value.to_ascii_lowercase()) {
             Some(target) if target == "capacity" => {
-                if backpack.upgrade_capacity() {
+                if cmd.backpack.upgrade_capacity() {
                     push_message(
                         chat,
-                        format!("Backpack capacity is now {}.", backpack.capacity()),
+                        format!("Backpack capacity is now {}.", cmd.backpack.capacity()),
                         theme.colors.text,
                     );
                 } else {
@@ -595,7 +585,7 @@ fn execute_command(
                 );
                 return;
             };
-            if backpack.unlock_category(category) {
+            if cmd.backpack.unlock_category(category) {
                 push_message(
                     chat,
                     format!("Unlocked {} storage.", category.display_name()),
@@ -610,13 +600,10 @@ fn execute_command(
             }
         }
         "fly" => {
-            let Some(movement) = movement else {
-                push_message(chat, "Flight is unavailable.", theme.colors.danger);
-                return;
-            };
-            movement.flying = !movement.flying;
-            if movement.flying {
-                movement.noclip = true;
+            let m = &mut *cmd.movement_mode;
+            m.flying = !m.flying;
+            if m.flying {
+                m.noclip = true;
                 if let Some((_, player)) = player.as_mut() {
                     player.reset_motion();
                 }
@@ -626,26 +613,19 @@ fn execute_command(
                     theme.colors.text,
                 );
             } else {
-                movement.noclip = false;
+                m.noclip = false;
                 push_message(chat, "Flight off. Collision on.", theme.colors.text);
             }
         }
         "noclip" => {
-            let Some(movement) = movement else {
-                push_message(
-                    chat,
-                    "Collision control is unavailable.",
-                    theme.colors.danger,
-                );
-                return;
-            };
-            movement.noclip = !movement.noclip;
+            let m = &mut *cmd.movement_mode;
+            m.noclip = !m.noclip;
             if let Some((_, player)) = player.as_mut() {
                 player.reset_motion();
             }
             push_message(
                 chat,
-                if movement.noclip {
+                if m.noclip {
                     "Collision off."
                 } else {
                     "Collision on."
@@ -663,7 +643,7 @@ fn execute_command(
             };
 
             if player.is_some() {
-                pending_teleport.0 = Some(
+                cmd.pending_teleport.0 = Some(
                     Vec3::new(coordinates[0], coordinates[1], coordinates[2]) * BLOCKS_PER_METRE,
                 );
                 push_message(
@@ -678,8 +658,8 @@ fn execute_command(
         }
         "spawn" => {
             if player.is_some() {
-                pending_teleport.0 = Some(spawn.0);
-                let position = spawn.0 * BLOCK_SIZE;
+                cmd.pending_teleport.0 = Some(cmd.spawn.0);
+                let position = cmd.spawn.0 * BLOCK_SIZE;
                 push_message(
                     chat,
                     format!(
@@ -693,7 +673,7 @@ fn execute_command(
         "seed" => {
             push_message(
                 chat,
-                format!("World seed: {}", generator.0.seed),
+                format!("World seed: {}", cmd.generator.0.seed),
                 theme.colors.text,
             );
         }
@@ -710,6 +690,159 @@ fn execute_command(
                 );
             }
         }
+        "time" => match rest.first().copied() {
+            Some("set") => {
+                let Some(value) = rest.get(1) else {
+                    push_message(
+                        chat,
+                        "Usage: /time set <day|noon|sunset|night|midnight|ticks>",
+                        theme.colors.danger,
+                    );
+                    return;
+                };
+                let ticks = time_preset_ticks(value).or_else(|| value.parse::<u32>().ok());
+                if let Some(ticks) = ticks {
+                    cmd.day_night.set_daytime_ticks(ticks);
+                    push_message(
+                        chat,
+                        format!(
+                            "Set the time to {} ({})",
+                            cmd.day_night.daytime_ticks(),
+                            cmd.day_night.clock_string()
+                        ),
+                        theme.colors.text,
+                    );
+                } else {
+                    push_message(
+                        chat,
+                        "Usage: /time set <day|noon|sunset|night|midnight|ticks>",
+                        theme.colors.danger,
+                    );
+                }
+            }
+            Some("add") => {
+                let Some(value) = rest.get(1).and_then(|v| v.parse::<i64>().ok()) else {
+                    push_message(chat, "Usage: /time add <ticks>", theme.colors.danger);
+                    return;
+                };
+                if value < 0 {
+                    push_message(
+                        chat,
+                        "Tick count must be non-negative.",
+                        theme.colors.danger,
+                    );
+                    return;
+                }
+                cmd.day_night.add_ticks(value);
+                push_message(
+                    chat,
+                    format!(
+                        "Added {} ticks. Daytime is now {}.",
+                        value,
+                        cmd.day_night.daytime_ticks()
+                    ),
+                    theme.colors.text,
+                );
+            }
+            Some("query") => {
+                let Some(what) = rest.get(1).copied() else {
+                    push_message(
+                        chat,
+                        "Usage: /time query <daytime|gametime|day>",
+                        theme.colors.danger,
+                    );
+                    return;
+                };
+                match what {
+                    "daytime" => push_message(
+                        chat,
+                        format!("The time is {}", cmd.day_night.daytime_ticks()),
+                        theme.colors.text,
+                    ),
+                    "gametime" => push_message(
+                        chat,
+                        format!("The time is {}", cmd.day_night.gametime_ticks),
+                        theme.colors.text,
+                    ),
+                    "day" => push_message(
+                        chat,
+                        format!("The time is {}", cmd.day_night.day_count),
+                        theme.colors.text,
+                    ),
+                    _ => push_message(
+                        chat,
+                        "Usage: /time query <daytime|gametime|day>",
+                        theme.colors.danger,
+                    ),
+                }
+            }
+            Some("speed") => {
+                let Some(value) = rest.get(1).and_then(|v| v.parse::<f32>().ok()) else {
+                    push_message(chat, "Usage: /time speed <multiplier>", theme.colors.danger);
+                    return;
+                };
+                if !value.is_finite() || value < 0.0 {
+                    push_message(
+                        chat,
+                        "Speed must be a finite number >= 0.",
+                        theme.colors.danger,
+                    );
+                    return;
+                }
+                cmd.day_night.time_scale = value;
+                push_message(
+                    chat,
+                    format!("Day/night speed set to {}x.", value),
+                    theme.colors.text,
+                );
+            }
+            Some("cycle") => {
+                let Some(value) = rest.get(1).copied() else {
+                    push_message(chat, "Usage: /time cycle <true|false>", theme.colors.danger);
+                    return;
+                };
+                let enabled = match value {
+                    "true" | "on" | "1" => Some(true),
+                    "false" | "off" | "0" => Some(false),
+                    _ => None,
+                };
+                if let Some(enabled) = enabled {
+                    cmd.day_night.cycle_enabled = enabled;
+                    push_message(
+                        chat,
+                        if enabled {
+                            "Day/night cycle enabled."
+                        } else {
+                            "Day/night cycle disabled."
+                        },
+                        theme.colors.text,
+                    );
+                } else {
+                    push_message(chat, "Usage: /time cycle <true|false>", theme.colors.danger);
+                }
+            }
+            None => {
+                push_message(
+                    chat,
+                    format!(
+                        "Daytime: {} | Gametime: {} | Day: {} | Speed: {}x | Cycle: {}",
+                        cmd.day_night.daytime_ticks(),
+                        cmd.day_night.gametime_ticks,
+                        cmd.day_night.day_count,
+                        cmd.day_night.time_scale,
+                        cmd.day_night.cycle_enabled
+                    ),
+                    theme.colors.text,
+                );
+            }
+            _ => {
+                push_message(
+                    chat,
+                    "Usage: /time <set|add|query|speed|cycle> ...",
+                    theme.colors.danger,
+                );
+            }
+        },
         "" => {}
         other => {
             push_message(
@@ -718,6 +851,19 @@ fn execute_command(
                 theme.colors.danger,
             );
         }
+    }
+}
+
+/// Named `/time set` presets in Minecraft daytime ticks (0 = 06:00 sunrise).
+fn time_preset_ticks(value: &str) -> Option<u32> {
+    match value {
+        "day" | "sunrise" => Some(0),
+        "morning" => Some(1_000),
+        "noon" => Some(6_000),
+        "sunset" => Some(12_000),
+        "night" => Some(13_000),
+        "midnight" => Some(18_000),
+        _ => None,
     }
 }
 
@@ -981,6 +1127,16 @@ mod tests {
     fn attachment_item_names_are_recognised_by_commands() {
         assert_eq!(ItemId::from_name("lantern"), Some(ItemId::Lantern));
         assert_eq!(ItemId::from_name("magnet"), Some(ItemId::Magnet));
+    }
+
+    #[test]
+    fn time_presets_use_minecraft_daytime_ticks() {
+        assert_eq!(time_preset_ticks("sunrise"), Some(0));
+        assert_eq!(time_preset_ticks("noon"), Some(6_000));
+        assert_eq!(time_preset_ticks("sunset"), Some(12_000));
+        assert_eq!(time_preset_ticks("night"), Some(13_000));
+        assert_eq!(time_preset_ticks("midnight"), Some(18_000));
+        assert_eq!(time_preset_ticks("invalid"), None);
     }
 
     #[test]

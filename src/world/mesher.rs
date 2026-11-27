@@ -23,8 +23,8 @@ use super::block::{
     stem_bounds_for_shape,
 };
 use super::chunk::{
-    CHUNK_X, CHUNK_Y, CHUNK_Z, ChunkData, DETAILS_PER_WORLD_AXIS, SurfaceLayer, WORLD_CHUNK_X,
-    WORLD_CHUNK_Y, WORLD_CHUNK_Z,
+    CHUNK_X, CHUNK_Y, CHUNK_Z, ChunkData, DETAILS_PER_WORLD_AXIS, SEA_LEVEL_WORLD, SurfaceLayer,
+    WORLD_CHUNK_X, WORLD_CHUNK_Y, WORLD_CHUNK_Z,
 };
 
 #[cfg(test)]
@@ -237,7 +237,34 @@ fn emit_small_foliage(
         ),
     ];
     for (points, normal) in faces {
-        push_foliage_face(buffers, origin, points, normal, block, orientation);
+        // Small foliage is a single clump; anchor by local vertical.
+        let transformed = points.map(|point| origin + transform_point(point, orientation));
+        let normal = transform_normal(normal, orientation).normalize();
+        let shade = shade_for_normal(normal);
+        let srgb = block.srgb();
+        let linear = [
+            srgb_to_linear(srgb[0]),
+            srgb_to_linear(srgb[1]),
+            srgb_to_linear(srgb[2]),
+        ];
+        let base_index = buffers.positions.len() as u32;
+        for point in &transformed {
+            buffers.positions.push(point.to_array());
+            buffers.normals.push(normal.to_array());
+            buffers
+                .colors
+                .push([linear[0] * shade, linear[1] * shade, linear[2] * shade, 1.0]);
+            let vertical = ((point[1] - origin.y) / 0.75).clamp(0.0, 1.0);
+            buffers.wind_weights.push(vertical);
+        }
+        buffers.indices.extend_from_slice(&[
+            base_index,
+            base_index + 1,
+            base_index + 2,
+            base_index,
+            base_index + 2,
+            base_index + 3,
+        ]);
     }
     let _ = (x, y, z);
 }
@@ -274,6 +301,24 @@ pub const WIND_WEIGHT_LOCATION: u32 = 14;
 pub const ATTRIBUTE_WIND_WEIGHT: MeshVertexAttribute =
     MeshVertexAttribute::new("WindWeight", 988540917, VertexFormat::Float32);
 
+/// Shader location for per-vertex water wave weight.
+pub const WAVE_WEIGHT_LOCATION: u32 = 15;
+
+/// Per-vertex wave weight for water meshes: 0 keeps a vertex anchored, 1 lets
+/// it follow the shared surface wave. Side faces interpolate between them.
+pub const ATTRIBUTE_WAVE_WEIGHT: MeshVertexAttribute =
+    MeshVertexAttribute::new("WaveWeight", 988540918, VertexFormat::Float32);
+
+/// Shader location for normalized water depth over the voxel seabed.
+pub const WATER_DEPTH_LOCATION: u32 = 16;
+
+/// Per-vertex water depth: 0 at the seabed, 1 at the maximum visual depth.
+pub const ATTRIBUTE_WATER_DEPTH: MeshVertexAttribute =
+    MeshVertexAttribute::new("WaterDepth", 988540919, VertexFormat::Float32);
+
+/// Maximum visual water depth in 1 m world voxels.
+const MAX_WATER_DEPTH_WORLD: i32 = 18;
+
 /// Buffers for a single chunk mesh.
 #[derive(Default)]
 pub struct MeshBuffers {
@@ -282,6 +327,10 @@ pub struct MeshBuffers {
     pub colors: Vec<[f32; 4]>,
     /// Per-vertex wind weight. Only populated for foliage meshes.
     pub wind_weights: Vec<f32>,
+    /// Per-vertex wave weight. Only populated for water meshes.
+    pub wave_weights: Vec<f32>,
+    /// Per-vertex normalized seabed depth. Only populated for water meshes.
+    pub water_depths: Vec<f32>,
     pub indices: Vec<u32>,
 }
 
@@ -297,14 +346,18 @@ impl MeshBuffers {
     }
 
     pub fn into_mesh(self) -> Option<Mesh> {
-        self.into_mesh_with_wind(false)
+        self.into_mesh_with_attributes(false, false)
     }
 
     pub fn into_foliage_mesh(self) -> Option<Mesh> {
-        self.into_mesh_with_wind(true)
+        self.into_mesh_with_attributes(true, false)
     }
 
-    fn into_mesh_with_wind(self, wind: bool) -> Option<Mesh> {
+    pub fn into_water_mesh(self) -> Option<Mesh> {
+        self.into_mesh_with_attributes(false, true)
+    }
+
+    fn into_mesh_with_attributes(self, wind: bool, water: bool) -> Option<Mesh> {
         if self.is_empty() {
             return None;
         }
@@ -325,6 +378,20 @@ impl MeshBuffers {
                 self.wind_weights
             };
             mesh.insert_attribute(ATTRIBUTE_WIND_WEIGHT, weights);
+        }
+        if water {
+            let weights = if self.wave_weights.is_empty() {
+                vec![0.0; mesh.count_vertices()]
+            } else {
+                self.wave_weights
+            };
+            mesh.insert_attribute(ATTRIBUTE_WAVE_WEIGHT, weights);
+            let depths = if self.water_depths.is_empty() {
+                vec![0.0; mesh.count_vertices()]
+            } else {
+                self.water_depths
+            };
+            mesh.insert_attribute(ATTRIBUTE_WATER_DEPTH, depths);
         }
         mesh.insert_indices(Indices::U32(self.indices));
         Some(mesh)
@@ -391,6 +458,7 @@ fn compute_ao(data: &ChunkData, dir: FaceDir, block: [i32; 3]) -> [u8; 4] {
 
 #[allow(clippy::too_many_arguments)]
 fn emit_quad(
+    data: &ChunkData,
     buffers: &mut MeshBuffers,
     dir: FaceDir,
     slice: usize,
@@ -400,6 +468,7 @@ fn emit_quad(
     height: usize,
     key: FaceKey,
     scale: f32,
+    water_top: bool,
 ) {
     let mut plane = (slice as f32 + if dir.sign > 0 { 1.0 } else { 0.0 }) * scale;
     // Water sits slightly below the voxel's top edge. Only the upward face is
@@ -438,16 +507,51 @@ fn emit_quad(
         ao_factor(key.ao[2]),
         ao_factor(key.ao[3]),
     ];
-    let corners = [(p0, ao[0]), (p1, ao[1]), (p2, ao[2]), (p3, ao[3])];
+    let corners = [
+        (p0, ao[0], 0usize, 0usize),
+        (p1, ao[1], 1usize, 0usize),
+        (p2, ao[2], 1usize, 1usize),
+        (p3, ao[3], 0usize, 1usize),
+    ];
+    let is_water = key.block.is_water();
+    let is_water_top_face = is_water && dir.axis == 1 && dir.sign > 0;
+    let vertical_is_u = dir.u_axis == 1;
 
-    for (position, factor) in corners {
+    for (mut position, factor, du, dv) in corners {
+        // Side faces share the surface wave only along their upper edge; lower
+        // vertices stay anchored so the side shears smoothly into the seabed.
+        let mut wave_weight = 0.0;
+        if is_water {
+            if is_water_top_face {
+                wave_weight = 1.0;
+            } else if dir.axis != 1 && water_top {
+                let upper_corner = if vertical_is_u { du == 1 } else { dv == 1 };
+                if upper_corner {
+                    position.y -= PANEL_HEIGHT;
+                    wave_weight = 1.0;
+                }
+            }
+        }
+
+        // Whole water columns share their seabed depth, including side faces.
+        let water_depth = if is_water {
+            water_depth_at_position(data, position)
+        } else {
+            0.0
+        };
         // AO and the directional tint stay independent, then combine.
         let shade = tint * factor;
         buffers.positions.push(position.to_array());
         buffers.normals.push(normal.to_array());
-        buffers
-            .colors
-            .push([linear[0] * shade, linear[1] * shade, linear[2] * shade, 1.0]);
+        buffers.colors.push(if is_water {
+            // Water's shader ignores vertex colors; keep zeroed values so the
+            // existing water mesh layout is unchanged.
+            [0.0, 0.0, 0.0, 0.0]
+        } else {
+            [linear[0] * shade, linear[1] * shade, linear[2] * shade, 1.0]
+        });
+        buffers.wave_weights.push(wave_weight);
+        buffers.water_depths.push(water_depth);
     }
 
     // Split the quad along the diagonal that follows the brighter corners.
@@ -473,6 +577,17 @@ fn emit_quad(
     }
 }
 
+/// Normalized column depth for any water vertex. Uses the sea surface rather
+/// than the vertex height so top, side and bottom faces of one water column all
+/// share the same depth and darken together.
+fn water_depth_at_position(data: &ChunkData, position: Vec3) -> f32 {
+    let world_scale = DETAILS_PER_WORLD_AXIS as f32;
+    let local_x = (position.x / world_scale).floor() as i32;
+    let local_z = (position.z / world_scale).floor() as i32;
+    let seabed_y = data.world_height_local(local_x, local_z);
+    (SEA_LEVEL_WORLD - seabed_y).clamp(0, MAX_WATER_DEPTH_WORLD) as f32
+        / MAX_WATER_DEPTH_WORLD as f32
+}
 /// Build both meshes for a chunk.
 pub fn mesh_chunk(data: &ChunkData) -> ChunkMeshData {
     let mut output = ChunkMeshData::default();
@@ -543,21 +658,19 @@ pub fn mesh_chunk(data: &ChunkData) -> ChunkMeshData {
                         continue;
                     };
 
-                    // Only faces with a flat AO pattern may merge: a merged
-                    // quad carries one value per corner, so merging across an
-                    // AO gradient would stretch that gradient over the whole
-                    // rectangle. Flat regions still merge fully.
-                    let flat = key.has_flat_ao();
+                    // Water is not greedily merged; one quad per cell preserves
+                    // the existing wave and depth corner sampling.
+                    let can_merge = !key.block.is_water() && key.has_flat_ao();
 
                     let mut width = 1;
-                    if flat {
+                    if can_merge {
                         while u + width < dim_u && mask[u + width + v * dim_u] == Some(key) {
                             width += 1;
                         }
                     }
 
                     let mut height = 1;
-                    if flat {
+                    if can_merge {
                         'grow: while v + height < dim_v {
                             for k in 0..width {
                                 if mask[u + k + (v + height) * dim_u] != Some(key) {
@@ -579,7 +692,17 @@ pub fn mesh_chunk(data: &ChunkData) -> ChunkMeshData {
                     } else {
                         &mut output.opaque
                     };
-                    emit_quad(buffers, dir, slice, u, v, width, height, key, 1.0);
+                    let mut above = [0i32; 3];
+                    above[dir.axis] = slice as i32;
+                    above[dir.u_axis] = u as i32;
+                    above[dir.v_axis] = v as i32;
+                    above[1] += 1;
+                    let water_top = key.block.is_water()
+                        && dir.axis != 1
+                        && data.sample_local(above[0], above[1], above[2]).is_air();
+                    emit_quad(
+                        data, buffers, dir, slice, u, v, width, height, key, 1.0, water_top,
+                    );
 
                     u += width;
                 }
@@ -665,17 +788,17 @@ fn mesh_world(data: &ChunkData, output: &mut ChunkMeshData) {
                         continue;
                     };
 
-                    let flat = key.has_flat_ao();
+                    let can_merge = !key.block.is_water() && key.has_flat_ao();
 
                     let mut width = 1;
-                    if flat {
+                    if can_merge {
                         while u + width < dim_u && mask[u + width + v * dim_u] == Some(key) {
                             width += 1;
                         }
                     }
 
                     let mut height = 1;
-                    if flat {
+                    if can_merge {
                         'grow: while v + height < dim_v {
                             for k in 0..width {
                                 if mask[u + k + (v + height) * dim_u] != Some(key) {
@@ -697,7 +820,29 @@ fn mesh_world(data: &ChunkData, output: &mut ChunkMeshData) {
                     } else {
                         &mut output.opaque
                     };
-                    emit_quad(buffers, dir, slice, u, v, width, height, key, WORLD_SCALE);
+                    let mut above = [0i32; 3];
+                    above[dir.axis] = slice as i32;
+                    above[dir.u_axis] = u as i32;
+                    above[dir.v_axis] = v as i32;
+                    above[1] += 1;
+                    let water_top = key.block.is_water()
+                        && dir.axis != 1
+                        && data
+                            .sample_world_local(above[0], above[1], above[2])
+                            .is_air();
+                    emit_quad(
+                        data,
+                        buffers,
+                        dir,
+                        slice,
+                        u,
+                        v,
+                        width,
+                        height,
+                        key,
+                        WORLD_SCALE,
+                        water_top,
+                    );
 
                     u += width;
                 }
@@ -1033,14 +1178,17 @@ fn emit_foliage(
         let neighbour = data.sample_local(x + offset.x, y + offset.y, z + offset.z);
         if neighbour.is_solid() && matches!(neighbour.shape(), Shape::Foliage | Shape::SmallFoliage)
         {
+            // Shared boundary vertices get identical wind displacement, so
+            // internal faces stay hidden; skip for culling/overdraw.
             continue;
         }
-        push_foliage_face(buffers, origin, points, normal, block, orientation);
+        push_foliage_face(data, buffers, origin, points, normal, block, orientation);
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn push_foliage_face(
+    data: &ChunkData,
     buffers: &mut MeshBuffers,
     origin: Vec3,
     points: [Vec3; 4],
@@ -1050,15 +1198,15 @@ fn push_foliage_face(
 ) {
     let transformed = points.map(|point| origin + transform_point(point, orientation));
     let normal = transform_normal(normal, orientation).normalize();
-    push_foliage_vertices(buffers, &transformed, normal, block, origin.y);
+    push_foliage_vertices(data, buffers, &transformed, normal, block);
 }
 
 fn push_foliage_vertices(
+    data: &ChunkData,
     buffers: &mut MeshBuffers,
     points: &[Vec3],
     normal: Vec3,
     block: Block,
-    base_y: f32,
 ) {
     let shade = shade_for_normal(normal);
     let srgb = block.srgb();
@@ -1075,9 +1223,25 @@ fn push_foliage_vertices(
         buffers
             .colors
             .push([linear[0] * shade, linear[1] * shade, linear[2] * shade, 1.0]);
-        // Sway weight: 0 at the cell base, 1 at the top. The shader uses a coarse
-        // phase grid so adjacent cells move together and don't open gaps.
-        let weight = ((point[1] - base_y) / 1.0).clamp(0.0, 1.0);
+        // World-position-based weight: identical world positions get identical
+        // displacement, keeping adjacent foliage blocks connected. Anchor only
+        // where foliage has no foliage below it (ground/base of canopy column).
+        let wx = point[0].floor() as i32;
+        let wy = point[1].floor() as i32;
+        let wz = point[2].floor() as i32;
+        let here = data.sample_local(wx, wy, wz);
+        let below = data.sample_local(wx, wy - 1, wz);
+        let below_foliage =
+            below.is_solid() && matches!(below.shape(), Shape::Foliage | Shape::SmallFoliage);
+        let here_foliage =
+            here.is_solid() && matches!(here.shape(), Shape::Foliage | Shape::SmallFoliage);
+        let vertical = (point[1] - wy as f32).clamp(0.0, 1.0);
+        // Anchor bottom of canopy columns; keep connected continuity above.
+        let weight = if !below_foliage && (here_foliage || vertical < 0.08) {
+            vertical
+        } else {
+            1.0
+        };
         buffers.wind_weights.push(weight);
     }
 
@@ -2127,6 +2291,249 @@ mod tests {
                 .all(|position| (position[1] - surface_y).abs() < 1e-4),
             "water top should sit at {surface_y}: {top_vertices:?}"
         );
+    }
+
+    fn water_vertices(mesh: &MeshBuffers) -> Vec<([f32; 3], [f32; 3], f32)> {
+        mesh.positions
+            .iter()
+            .zip(mesh.normals.iter())
+            .zip(mesh.wave_weights.iter())
+            .map(|((position, normal), weight)| (*position, *normal, *weight))
+            .collect()
+    }
+
+    #[test]
+    fn water_side_top_edges_match_the_surface() {
+        let mut data = empty_chunk();
+        data.set_local(8, 10, 8, Block::Water);
+        data.set_local(8, 9, 8, Block::Granite);
+        let mesh = mesh_chunk(&data);
+        let surface_y = 11.0 - PANEL_HEIGHT;
+        let vertices = water_vertices(&mesh.water);
+
+        let top: Vec<_> = vertices
+            .iter()
+            .copied()
+            .filter(|(_, normal, _)| normal[1] > 0.5)
+            .collect();
+        assert_eq!(top.len(), 4);
+        assert!(top.iter().all(|(position, _, weight)| {
+            (position[1] - surface_y).abs() < 1e-4 && (*weight - 1.0).abs() < 1e-6
+        }));
+
+        let side_top: Vec<_> = vertices
+            .iter()
+            .copied()
+            .filter(|(position, normal, _)| {
+                normal[1].abs() < 0.5 && (position[1] - surface_y).abs() < 1e-4
+            })
+            .collect();
+        assert!(!side_top.is_empty());
+        assert!(
+            side_top
+                .iter()
+                .all(|(_, _, weight)| (*weight - 1.0).abs() < 1e-6)
+        );
+
+        let side_bottom: Vec<_> = vertices
+            .iter()
+            .copied()
+            .filter(|(position, normal, _)| {
+                normal[1].abs() < 0.5 && (position[1] - 10.0).abs() < 1e-4
+            })
+            .collect();
+        assert!(!side_bottom.is_empty());
+        assert!(side_bottom.iter().all(|(_, _, weight)| weight.abs() < 1e-6));
+
+        for (position, _, _) in &side_top {
+            assert!(
+                top.iter().any(|(top_position, _, _)| {
+                    (top_position[0] - position[0]).abs() < 1e-4
+                        && (top_position[2] - position[2]).abs() < 1e-4
+                }),
+                "side top corner {position:?} should share a top-face corner"
+            );
+        }
+    }
+
+    #[test]
+    fn water_surface_is_continuous_across_chunk_boundaries() {
+        let mut left = empty_chunk();
+        left.set_local(31, 10, 8, Block::Water);
+        left.set_local(31, 9, 8, Block::Granite);
+        // Padded neighbour at local x=32, belonging to the next chunk.
+        left.set_padded(33, 11, 9, Block::Water);
+
+        let mut right = ChunkData::new(IVec3::new(1, 0, 0));
+        right.set_local(0, 10, 8, Block::Water);
+        right.set_local(0, 9, 8, Block::Granite);
+        // Padded neighbour at local x=-1, belonging to the previous chunk.
+        right.set_padded(0, 11, 9, Block::Water);
+
+        let left_vertices = water_vertices(&mesh_chunk(&left).water);
+        let right_vertices = water_vertices(&mesh_chunk(&right).water);
+
+        assert!(left_vertices.iter().copied().all(|(position, normal, _)| {
+            !(normal[0] > 0.5 && (position[0] - 32.0).abs() < 1e-4)
+        }));
+        assert!(
+            right_vertices
+                .iter()
+                .copied()
+                .all(|(position, normal, _)| { !(normal[0] < -0.5 && position[0].abs() < 1e-4) })
+        );
+
+        let left_origin = crate::world::chunk_origin(left.coord);
+        let right_origin = crate::world::chunk_origin(right.coord);
+        let left_edge: Vec<(f32, f32, f32, f32)> = left_vertices
+            .iter()
+            .copied()
+            .filter(|(position, normal, _)| normal[1] > 0.5 && (position[0] - 32.0).abs() < 1e-4)
+            .map(|(position, _, weight)| {
+                (
+                    position[0] + left_origin.x,
+                    position[1] + left_origin.y,
+                    position[2] + left_origin.z,
+                    weight,
+                )
+            })
+            .collect();
+        let right_edge: Vec<(f32, f32, f32, f32)> = right_vertices
+            .iter()
+            .copied()
+            .filter(|(position, normal, _)| normal[1] > 0.5 && position[0].abs() < 1e-4)
+            .map(|(position, _, weight)| {
+                (
+                    position[0] + right_origin.x,
+                    position[1] + right_origin.y,
+                    position[2] + right_origin.z,
+                    weight,
+                )
+            })
+            .collect();
+
+        assert_eq!(left_edge.len(), 2);
+        assert_eq!(right_edge.len(), 2);
+        for corner in &left_edge {
+            assert!(
+                right_edge.iter().any(|other| {
+                    (other.0 - corner.0).abs() < 1e-4
+                        && (other.1 - corner.1).abs() < 1e-4
+                        && (other.2 - corner.2).abs() < 1e-4
+                        && (other.3 - corner.3).abs() < 1e-6
+                }),
+                "boundary corner {corner:?} should match the adjacent chunk"
+            );
+        }
+    }
+
+    fn fill_world_heights(data: &mut ChunkData, height_at: impl Fn(i32, i32) -> i32) {
+        let origin_x = data.coord.x * WORLD_CHUNK_X as i32;
+        let origin_z = data.coord.z * WORLD_CHUNK_Z as i32;
+        for pz in 0..WORLD_PADDED_Z {
+            for px in 0..WORLD_PADDED_X {
+                let local_x = px as i32 - 1;
+                let local_z = pz as i32 - 1;
+                data.world_heights[pz * WORLD_PADDED_X + px] =
+                    height_at(origin_x + local_x, origin_z + local_z);
+            }
+        }
+    }
+
+    #[test]
+    fn water_depth_increases_with_seabed_distance() {
+        let depth_for = |seabed_y| {
+            let mut data = ChunkData::new(IVec3::ZERO);
+            fill_world_heights(&mut data, |_x, _z| seabed_y);
+            water_depth_at_position(&data, Vec3::new(16.0, 0.0, 16.0))
+        };
+
+        let shallow = depth_for(-1);
+        let deep = depth_for(-4);
+        let very_deep = depth_for(-8);
+        assert!(shallow > 0.0);
+        assert!(deep > shallow, "shallow={shallow}, deep={deep}");
+        assert!(very_deep > deep, "deep={deep}, very_deep={very_deep}");
+        assert_eq!(depth_for(-18), 1.0);
+    }
+
+    #[test]
+    fn water_depth_is_column_based_not_vertex_height_based() {
+        let mut data = ChunkData::new(IVec3::ZERO);
+        fill_world_heights(&mut data, |_x, _z| -8);
+        let surface = water_depth_at_position(&data, Vec3::new(16.0, 0.0, 16.0));
+        let side = water_depth_at_position(&data, Vec3::new(16.0, -8.0, 16.0));
+        assert_eq!(surface, side);
+
+        let mut chunk = empty_chunk();
+        fill_world_heights(&mut chunk, |_x, _z| -8);
+        chunk.set_local(8, 8, 8, Block::Water);
+        let water = mesh_chunk(&chunk).water;
+        let side_depths: Vec<f32> = water
+            .positions
+            .iter()
+            .zip(water.normals.iter())
+            .zip(water.water_depths.iter())
+            .filter(|((_position, normal), _)| normal[1].abs() < 0.5)
+            .map(|((_, _), depth)| *depth)
+            .collect();
+        assert!(!side_depths.is_empty());
+        assert!(side_depths.iter().all(|depth| *depth > 0.0));
+    }
+
+    #[test]
+    fn water_depth_matches_at_shared_corners() {
+        let height_at = |x: i32, z: i32| 4 + (x * 3 + z * 5).rem_euclid(6);
+        let mut left = ChunkData::new(IVec3::ZERO);
+        fill_world_heights(&mut left, height_at);
+        let mut right = ChunkData::new(IVec3::new(1, 0, 0));
+        fill_world_heights(&mut right, height_at);
+
+        // The same physical corner is local x=32 in the left chunk and x=0 in
+        // the right chunk.
+        let a = water_depth_at_position(&left, Vec3::new(32.0, 0.0, 16.0));
+        let b = water_depth_at_position(&right, Vec3::new(0.0, 0.0, 16.0));
+        assert!((a - b).abs() < 1e-6, "{a} vs {b}");
+    }
+
+    fn water_edge_depths(mesh: &MeshBuffers, edge_x: f32) -> Vec<(f32, f32)> {
+        mesh.positions
+            .iter()
+            .zip(mesh.normals.iter())
+            .zip(mesh.water_depths.iter())
+            .filter(|((position, normal), _)| {
+                normal[1] > 0.5 && (position[0] - edge_x).abs() < 1e-4
+            })
+            .map(|((position, _), depth)| (position[2], *depth))
+            .collect()
+    }
+
+    #[test]
+    fn water_depth_matches_across_chunk_boundaries() {
+        let mut left = empty_chunk();
+        fill_world_heights(&mut left, |_x, _z| -2);
+        left.set_local(31, 10, 8, Block::Water);
+        left.set_padded(33, 10, 8, Block::Water);
+
+        let mut right = ChunkData::new(IVec3::new(1, 0, 0));
+        fill_world_heights(&mut right, |_x, _z| -2);
+        right.set_local(0, 10, 8, Block::Water);
+        right.set_padded(0, 10, 8, Block::Water);
+
+        let left_depths = water_edge_depths(&mesh_chunk(&left).water, 32.0);
+        let right_depths = water_edge_depths(&mesh_chunk(&right).water, 0.0);
+        assert!(!left_depths.is_empty());
+        assert_eq!(left_depths.len(), right_depths.len());
+        for (z, depth) in left_depths {
+            let matching = right_depths
+                .iter()
+                .find(|(other_z, _)| (other_z - z).abs() < 1e-4);
+            assert!(
+                matching.is_some(),
+                "missing matching boundary vertex at z={z}"
+            );
+            assert!((matching.unwrap().1 - depth).abs() < 1e-6);
+        }
     }
 
     fn scenario_chunk(kind: &str) -> ChunkData {

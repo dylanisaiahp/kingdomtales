@@ -5,8 +5,9 @@
 //! hand; if in backpack slots (1-3), no hand model is shown.
 //! Magnet: pulls/picks up drops when attached (handled in interaction).
 
-use bevy::light::NotShadowCaster;
+use bevy::light::{NotShadowCaster, NotShadowReceiver};
 use bevy::prelude::*;
+use bevy::world_serialization::{WorldAsset, WorldAssetRoot};
 
 use crate::backpack::Backpack;
 use crate::items::ItemId;
@@ -27,123 +28,33 @@ struct BackpackLanternLight;
 #[derive(Component)]
 struct OffhandLanternModel;
 
-fn spawn_offhand_lantern(
-    commands: &mut Commands,
-    meshes: &mut Assets<Mesh>,
-    materials: &mut Assets<StandardMaterial>,
-) -> Entity {
-    let frame_mat = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.35, 0.27, 0.18),
-        unlit: true,
-        ..default()
-    });
-    let glass_mat = materials.add(StandardMaterial {
-        base_color: Color::srgba(1.0, 0.9, 0.55, 0.2),
-        alpha_mode: AlphaMode::Blend,
-        emissive: LinearRgba::new(1.2, 1.0, 0.35, 1.0),
-        perceptual_roughness: 0.1,
-        ..default()
-    });
-    let core_mat = materials.add(StandardMaterial {
-        base_color: Color::srgb(1.0, 0.93, 0.15),
-        emissive: LinearRgba::new(10.0, 8.0, 0.6, 1.0),
-        emissive_exposure_weight: 0.0,
-        unlit: true,
-        ..default()
-    });
-    let glow_mat = materials.add(StandardMaterial {
-        base_color: Color::srgba(1.0, 0.88, 0.2, 0.25),
-        emissive: LinearRgba::new(3.0, 2.4, 0.2, 1.0),
-        emissive_exposure_weight: 0.0,
-        alpha_mode: AlphaMode::Add,
-        unlit: true,
-        cull_mode: None,
-        ..default()
-    });
+/// Marks offhand GLB mesh children whose material is already a private clone.
+#[derive(Component)]
+struct OffhandLanternViewMaterial;
 
-    let cap = meshes.add(Cuboid::new(0.15, 0.025, 0.15));
-    let post = meshes.add(Cuboid::new(0.018, 0.16, 0.018));
-    let glass = meshes.add(Cuboid::new(0.105, 0.12, 0.105));
-    let core = meshes.add(Cuboid::new(0.065, 0.085, 0.065));
-    let glow = meshes.add(Cuboid::new(0.085, 0.105, 0.085));
-    let handle = meshes.add(Cuboid::new(0.025, 0.07, 0.07));
-
-    let root = commands
+fn spawn_offhand_lantern(commands: &mut Commands, asset_server: &AssetServer) -> Entity {
+    let scene: Handle<WorldAsset> = asset_server.load("models/items/lantern.glb#Scene0");
+    commands
         .spawn((
             OffhandLanternModel,
-            Transform::from_translation(OFFHAND_LANTERN_POS).with_rotation(Quat::from_euler(
-                EulerRot::XYZ,
-                -0.08,
-                0.25,
-                0.05,
-            )),
+            Transform::from_translation(OFFHAND_LANTERN_POS)
+                .with_rotation(Quat::from_euler(EulerRot::XYZ, -0.08, 0.25, 0.05))
+                .with_scale(Vec3::splat(1.15)),
             Visibility::Hidden,
+            WorldAssetRoot(scene),
+            NotShadowCaster,
+            NotShadowReceiver,
             Name::new("OffhandLantern"),
         ))
-        .id();
-
-    for y in [0.085_f32, -0.105] {
-        commands.spawn((
-            Mesh3d(cap.clone()),
-            MeshMaterial3d(frame_mat.clone()),
-            Transform::from_xyz(0.0, y, 0.0),
-            NotShadowCaster,
-            ChildOf(root),
-        ));
-    }
-    for (x, z) in [
-        (-0.058, -0.058),
-        (0.058, -0.058),
-        (-0.058, 0.058),
-        (0.058, 0.058),
-    ] {
-        commands.spawn((
-            Mesh3d(post.clone()),
-            MeshMaterial3d(frame_mat.clone()),
-            Transform::from_xyz(x, -0.01, z),
-            NotShadowCaster,
-            ChildOf(root),
-        ));
-    }
-    commands.spawn((
-        Mesh3d(glass),
-        MeshMaterial3d(glass_mat),
-        Transform::from_xyz(0.0, -0.01, 0.0),
-        NotShadowCaster,
-        ChildOf(root),
-    ));
-    commands.spawn((
-        Mesh3d(glow),
-        MeshMaterial3d(glow_mat),
-        Transform::from_xyz(0.0, -0.01, 0.0),
-        NotShadowCaster,
-        ChildOf(root),
-    ));
-    commands.spawn((
-        Mesh3d(core),
-        MeshMaterial3d(core_mat),
-        Transform::from_xyz(0.0, -0.01, 0.0),
-        NotShadowCaster,
-        ChildOf(root),
-    ));
-    commands.spawn((
-        Mesh3d(handle),
-        MeshMaterial3d(frame_mat),
-        Transform::from_xyz(0.0, 0.135, 0.0),
-        NotShadowCaster,
-        ChildOf(root),
-    ));
-    root
+        .id()
 }
 
-#[allow(clippy::too_many_arguments)]
 fn update_lantern(
     mut commands: Commands,
     backpack: Res<Backpack>,
     player: Query<&GlobalTransform, With<crate::player::Player>>,
     camera: Query<(Entity, &GlobalTransform), With<PlayerCamera>>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    asset_server: Res<AssetServer>,
     mut lights: Query<(Entity, &mut PointLight, &mut Transform), With<BackpackLanternLight>>,
     mut models: Query<&mut Visibility, With<OffhandLanternModel>>,
 ) {
@@ -196,7 +107,7 @@ fn update_lantern(
     if models.is_empty()
         && let Ok((cam_entity, _)) = camera.single()
     {
-        let root = spawn_offhand_lantern(&mut commands, &mut meshes, &mut materials);
+        let root = spawn_offhand_lantern(&mut commands, &asset_server);
         commands.entity(cam_entity).add_child(root);
     }
     for mut vis in &mut models {
@@ -211,13 +122,58 @@ fn update_lantern(
     }
 }
 
+/// Prepare offhand lantern children with the same mostly-unlit treatment used
+/// by held items. The lantern's own point light is extremely close to its model,
+/// so the shared GLB material would otherwise flash as the camera moves.
+fn prepare_offhand_lantern_viewmodel(
+    mut commands: Commands,
+    roots: Query<Entity, With<OffhandLanternModel>>,
+    children: Query<&Children>,
+    mesh_entities: Query<Entity, With<Mesh3d>>,
+    mesh_mats: Query<
+        (Entity, &MeshMaterial3d<StandardMaterial>),
+        Without<OffhandLanternViewMaterial>,
+    >,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    let mut stack: Vec<Entity> = roots.iter().collect();
+    while let Some(entity) = stack.pop() {
+        if mesh_entities.get(entity).is_ok() {
+            if let Ok((entity, handle)) = mesh_mats.get(entity)
+                && let Some(source) = materials.get(handle.0.id())
+            {
+                let mut material = source.clone();
+                crate::held_item::apply_viewmodel_material(&mut material);
+                let view_handle = materials.add(material);
+                commands.entity(entity).insert((
+                    MeshMaterial3d(view_handle),
+                    NotShadowCaster,
+                    NotShadowReceiver,
+                    OffhandLanternViewMaterial,
+                ));
+            } else {
+                commands
+                    .entity(entity)
+                    .insert((NotShadowCaster, NotShadowReceiver));
+            }
+        }
+        if let Ok(kids) = children.get(entity) {
+            for &kid in kids {
+                stack.push(kid);
+            }
+        }
+    }
+}
+
 pub struct AttachmentPlugin;
 
 impl Plugin for AttachmentPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(
             PostUpdate,
-            update_lantern.after(bevy::transform::TransformSystems::Propagate),
+            (update_lantern, prepare_offhand_lantern_viewmodel)
+                .chain()
+                .after(bevy::transform::TransformSystems::Propagate),
         );
     }
 }

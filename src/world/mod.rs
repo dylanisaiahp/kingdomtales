@@ -14,15 +14,18 @@ pub mod mesher;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::light::NotShadowCaster;
 use bevy::material::AlphaMode;
 use bevy::mesh::MeshVertexBufferLayoutRef;
 use bevy::pbr::{
-    ExtendedMaterial, MaterialExtension, MaterialExtensionKey, MaterialExtensionPipeline,
-    MaterialPlugin,
+    ExtendedMaterial, Material, MaterialExtension, MaterialExtensionKey, MaterialExtensionPipeline,
+    MaterialPipeline, MaterialPipelineKey, MaterialPlugin, MeshMaterial3d,
 };
 use bevy::prelude::*;
-use bevy::render::render_resource::{AsBindGroup, Face, SpecializedMeshPipelineError};
+use bevy::render::render_resource::{
+    AsBindGroup, Face, RenderPipelineDescriptor, ShaderType, SpecializedMeshPipelineError,
+};
 use bevy::tasks::{
     AsyncComputeTaskPool, Task, futures_lite::future::block_on, futures_lite::future::poll_once,
 };
@@ -60,7 +63,7 @@ const TELEPORT_PRELOAD_RADIUS: i32 = 2;
 const CHUNK_FADE_IN_SECS: f32 = 0.35;
 
 #[derive(Component)]
-struct ChunkFadeIn {
+pub(crate) struct ChunkFadeIn {
     remaining: f32,
     total: f32,
 }
@@ -246,29 +249,33 @@ impl Plugin for WorldPlugin {
         let generator = Arc::new(WorldGen::new(seed));
         let spawn = generator.find_spawn();
 
-        app.add_plugins(MaterialPlugin::<
-            ExtendedMaterial<StandardMaterial, FoliageWindMaterial>,
-        >::default())
-            .insert_resource(WorldGenResource(generator))
-            .insert_resource(SpawnPoint(spawn))
-            .init_resource::<ChunkManager>()
-            .init_resource::<WorldTimings>()
-            .init_resource::<PendingTeleport>()
-            .init_resource::<BiomeInfo>()
-            .init_resource::<InitialWorldLoad>()
-            .add_systems(Startup, setup_world)
-            .add_systems(First, apply_pending_teleport)
-            .add_systems(
-                Update,
-                (
-                    update_biome_info,
-                    poll_chunk_tasks,
-                    stream_chunks,
-                    animate_chunk_fade_in,
-                    distance_culling,
-                )
-                    .chain(),
-            );
+        app.add_plugins((
+            MaterialPlugin::<ExtendedMaterial<StandardMaterial, FoliageWindMaterial>>::default(),
+            MaterialPlugin::<WaterMaterial>::default(),
+        ))
+        .insert_resource(WorldGenResource(generator))
+        .insert_resource(SpawnPoint(spawn))
+        .init_resource::<ChunkManager>()
+        .init_resource::<WorldTimings>()
+        .init_resource::<PendingTeleport>()
+        .init_resource::<BiomeInfo>()
+        .init_resource::<InitialWorldLoad>()
+        .add_systems(Startup, setup_world)
+        .add_systems(First, apply_pending_teleport)
+        .add_systems(
+            Update,
+            (
+                update_biome_info,
+                poll_chunk_tasks,
+                stream_chunks,
+                animate_chunk_fade_in,
+                update_foliage_wind_materials,
+                configure_water_detail_sampler,
+                update_water_materials,
+                distance_culling,
+            )
+                .chain(),
+        );
     }
 }
 
@@ -380,10 +387,23 @@ pub struct PendingTeleport(pub Option<Vec3>);
 #[derive(Component)]
 pub struct ChunkEntity;
 
-/// Marker material for foliage wind sway. The actual motion is computed in the
-/// foliage vertex shader using global time and per-vertex wind weight.
-#[derive(Asset, AsBindGroup, TypePath, Debug, Clone, Default)]
-pub struct FoliageWindMaterial {}
+/// Material for foliage wind sway. Motion is computed in the foliage vertex
+/// shader using global time, per-vertex wind weight, and configurable strength.
+#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
+pub struct FoliageWindMaterial {
+    // x = wind strength, y = elapsed time. Time lives in the material uniform
+    // because Bevy's prepass view layout does not expose the globals binding.
+    #[uniform(100)]
+    pub params: Vec4,
+}
+
+impl Default for FoliageWindMaterial {
+    fn default() -> Self {
+        Self {
+            params: Vec4::new(0.075, 0.0, 0.0, 0.0),
+        }
+    }
+}
 
 impl MaterialExtension for FoliageWindMaterial {
     fn vertex_shader() -> bevy::shader::ShaderRef {
@@ -392,6 +412,17 @@ impl MaterialExtension for FoliageWindMaterial {
 
     fn fragment_shader() -> bevy::shader::ShaderRef {
         bevy::shader::ShaderRef::Default
+    }
+
+    fn prepass_vertex_shader() -> bevy::shader::ShaderRef {
+        // Use the prepass vertex interface with the same wind displacement as
+        // the forward shader. The default PBR prepass fragment shader remains
+        // in use, so foliage writes correct depth and normals for SSAO.
+        "shaders/foliage_wind_prepass.wesl".into()
+    }
+
+    fn enable_prepass() -> bool {
+        true
     }
 
     fn specialize(
@@ -427,6 +458,124 @@ impl MaterialExtension for FoliageWindMaterial {
                 offset: layout_attribute.offset,
                 shader_location: mesher::WIND_WEIGHT_LOCATION,
             });
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, ShaderType)]
+pub struct WaterUniformData {
+    pub time: f32,
+    pub alpha: f32,
+    pub wave_scale: f32,
+    pub _padding: f32,
+    pub camera: Vec4, // xyz=camera world pos
+    pub deep_color: Vec4,
+    pub shallow_color: Vec4,
+    pub sun_dir: Vec4,    // xyz=direction toward sun, w=daylight factor
+    pub sun_color: Vec4,  // rgb=tint, w=spec intensity
+    pub moon_dir: Vec4,   // xyz=direction toward moon, w=night factor
+    pub moon_color: Vec4, // rgb=tint, w=spec intensity
+}
+
+impl Default for WaterUniformData {
+    fn default() -> Self {
+        Self {
+            time: 0.0,
+            alpha: 1.0,
+            wave_scale: 1.35,
+            _padding: 0.0,
+            camera: Vec4::ZERO,
+            deep_color: Vec4::new(0.04, 0.18, 0.32, 0.74),
+            shallow_color: Vec4::new(0.16, 0.52, 0.58, 0.62),
+            sun_dir: Vec4::new(0.35, 0.8, 0.25, 1.0),
+            sun_color: Vec4::new(1.0, 0.96, 0.88, 0.8),
+            moon_dir: Vec4::new(-0.35, -0.8, -0.25, 0.0),
+            moon_color: Vec4::new(0.64, 0.74, 1.0, 0.0),
+        }
+    }
+}
+
+#[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
+pub struct WaterMaterial {
+    #[uniform(0)]
+    pub data: WaterUniformData,
+    #[texture(1)]
+    #[sampler(2)]
+    pub detail_texture: Handle<Image>,
+}
+
+impl WaterMaterial {
+    pub fn new(detail_texture: Handle<Image>) -> Self {
+        Self {
+            data: WaterUniformData::default(),
+            detail_texture,
+        }
+    }
+}
+
+impl Material for WaterMaterial {
+    fn vertex_shader() -> bevy::shader::ShaderRef {
+        "shaders/water.wesl".into()
+    }
+    fn fragment_shader() -> bevy::shader::ShaderRef {
+        "shaders/water.wesl".into()
+    }
+    fn alpha_mode(&self) -> AlphaMode {
+        AlphaMode::Blend
+    }
+    fn enable_prepass() -> bool {
+        // Custom water shader does not implement prepass variants; disabling
+        // avoids prepass specialization/render failures when SSAO/depth prepass is active.
+        false
+    }
+    fn enable_shadows() -> bool {
+        false
+    }
+    fn specialize(
+        _pipeline: &MaterialPipeline,
+        descriptor: &mut RenderPipelineDescriptor,
+        layout: &MeshVertexBufferLayoutRef,
+        _key: MaterialPipelineKey<Self>,
+    ) -> Result<(), SpecializedMeshPipelineError> {
+        descriptor.primitive.cull_mode = None;
+
+        let Some(vertex_layout) = descriptor.vertex.buffers.first_mut() else {
+            return Ok(());
+        };
+        let mut add_attribute = |id: bevy::mesh::MeshVertexAttributeId, location: u32| {
+            let Some(index) = layout
+                .0
+                .attribute_ids()
+                .iter()
+                .position(|candidate| *candidate == id)
+            else {
+                return;
+            };
+            if vertex_layout
+                .attributes
+                .iter()
+                .any(|attribute| attribute.shader_location == location)
+            {
+                return;
+            }
+            let layout_attribute = &layout.0.layout().attributes[index];
+            vertex_layout
+                .attributes
+                .push(bevy::render::render_resource::VertexAttribute {
+                    format: layout_attribute.format,
+                    offset: layout_attribute.offset,
+                    shader_location: location,
+                });
+        };
+        // Wave phase and normalized seabed depth are both per-vertex water data.
+        add_attribute(
+            mesher::ATTRIBUTE_WAVE_WEIGHT.id,
+            mesher::WAVE_WEIGHT_LOCATION,
+        );
+        add_attribute(
+            mesher::ATTRIBUTE_WATER_DEPTH.id,
+            mesher::WATER_DEPTH_LOCATION,
+        );
         Ok(())
     }
 }
@@ -470,12 +619,14 @@ pub struct ChunkManager {
     pub opaque_material: Handle<StandardMaterial>,
     /// Swaying foliage material using a custom vertex shader.
     pub foliage_material: Option<Handle<ExtendedMaterial<StandardMaterial, FoliageWindMaterial>>>,
-    pub water_material: Handle<StandardMaterial>,
+    pub water_material: Handle<WaterMaterial>,
+    /// Shared seamless detail tile used by every water material.
+    pub water_detail_texture: Handle<Image>,
     /// Per-chunk fade materials for newly loaded chunks (true alpha fade-in).
     pub opaque_fade_materials: HashMap<IVec3, Handle<StandardMaterial>>,
     pub foliage_fade_materials:
         HashMap<IVec3, Handle<ExtendedMaterial<StandardMaterial, FoliageWindMaterial>>>,
-    pub water_fade_materials: HashMap<IVec3, Handle<StandardMaterial>>,
+    pub water_fade_materials: HashMap<IVec3, Handle<WaterMaterial>>,
     /// Player edits to 0.5 m detail cells, kept for saving.
     pub detail_edits: HashMap<IVec3, Voxel>,
     /// Player edits to the authoritative 1 m world layer, kept for saving.
@@ -503,6 +654,7 @@ impl Default for ChunkManager {
             opaque_material: Handle::default(),
             foliage_material: None,
             water_material: Handle::default(),
+            water_detail_texture: Handle::default(),
             opaque_fade_materials: HashMap::new(),
             foliage_fade_materials: HashMap::new(),
             water_fade_materials: HashMap::new(),
@@ -1777,7 +1929,7 @@ fn generate_and_mesh(generator: &WorldGen, coord: IVec3) -> GeneratedChunk {
         data,
         opaque: opaque.into_mesh(),
         foliage: foliage.into_foliage_mesh(),
-        water: water.into_mesh(),
+        water: water.into_water_mesh(),
         triangles,
         foliage_triangles,
         water_triangles,
@@ -1787,12 +1939,14 @@ fn generate_and_mesh(generator: &WorldGen, coord: IVec3) -> GeneratedChunk {
 #[allow(clippy::too_many_arguments)]
 fn setup_world(
     mut commands: Commands,
+    asset_server: Res<AssetServer>,
     generator: Res<WorldGenResource>,
     spawn: Res<SpawnPoint>,
     mut manager: ResMut<ChunkManager>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut foliage_materials: ResMut<Assets<ExtendedMaterial<StandardMaterial, FoliageWindMaterial>>>,
+    mut water_materials: ResMut<Assets<WaterMaterial>>,
     mut initial_load: ResMut<InitialWorldLoad>,
 ) {
     // One material for all opaque chunk meshes. Vertex colours carry the block
@@ -1820,15 +1974,11 @@ fn setup_world(
         extension: FoliageWindMaterial::default(),
     }));
 
-    manager.water_material = materials.add(StandardMaterial {
-        base_color: Color::srgba(1.0, 1.0, 1.0, 0.72),
-        perceptual_roughness: 0.12,
-        metallic: 0.0,
-        reflectance: 0.45,
-        cull_mode: None,
-        alpha_mode: AlphaMode::Blend,
-        ..default()
-    });
+    // The default image plugin uses nearest sampling, matching the project's
+    // pixel-art look. All water materials share this one 32x32 seamless tile.
+    manager.water_detail_texture = asset_server.load("textures/water_detail.png");
+    manager.water_material =
+        water_materials.add(WaterMaterial::new(manager.water_detail_texture.clone()));
 
     let center = position_to_chunk(spawn.0);
     manager.last_center = Some(center);
@@ -1844,6 +1994,7 @@ fn setup_world(
         &mut meshes,
         &mut materials,
         &mut foliage_materials,
+        &mut water_materials,
         center,
         &mut initial_load,
     );
@@ -1861,6 +2012,7 @@ fn apply_pending_teleport(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut foliage_materials: ResMut<Assets<ExtendedMaterial<StandardMaterial, FoliageWindMaterial>>>,
+    mut water_materials: ResMut<Assets<WaterMaterial>>,
     mut player: Query<(&mut Transform, &mut Player), With<Player>>,
 ) {
     let Some(destination) = pending.0.take() else {
@@ -1878,6 +2030,7 @@ fn apply_pending_teleport(
         &mut meshes,
         &mut materials,
         &mut foliage_materials,
+        &mut water_materials,
         center,
     );
 
@@ -1895,6 +2048,7 @@ fn preload_safe_patch(
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
     foliage_materials: &mut Assets<ExtendedMaterial<StandardMaterial, FoliageWindMaterial>>,
+    water_materials: &mut Assets<WaterMaterial>,
     center: IVec3,
     initial_load: &mut InitialWorldLoad,
 ) {
@@ -1914,6 +2068,7 @@ fn preload_safe_patch(
                     meshes,
                     materials,
                     foliage_materials,
+                    water_materials,
                     generated,
                 );
                 initial_load.mark_loaded(coord);
@@ -1925,6 +2080,7 @@ fn preload_safe_patch(
 /// Teleport preload: keep a small safe patch synchronous, then spend a short
 /// bounded budget on closest-first nearby chunks. This avoids a full loading
 /// screen while preserving collision safety.
+#[allow(clippy::too_many_arguments)]
 fn preload_teleport_chunks(
     commands: &mut Commands,
     generator: &WorldGen,
@@ -1932,6 +2088,7 @@ fn preload_teleport_chunks(
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
     foliage_materials: &mut Assets<ExtendedMaterial<StandardMaterial, FoliageWindMaterial>>,
+    water_materials: &mut Assets<WaterMaterial>,
     center: IVec3,
 ) {
     let started = std::time::Instant::now();
@@ -1950,6 +2107,7 @@ fn preload_teleport_chunks(
                     meshes,
                     materials,
                     foliage_materials,
+                    water_materials,
                     generated,
                 );
             }
@@ -1990,6 +2148,7 @@ fn preload_teleport_chunks(
             meshes,
             materials,
             foliage_materials,
+            water_materials,
             generated,
         );
     }
@@ -2002,12 +2161,14 @@ fn accept_generated_chunk<T>(pending: &mut HashMap<IVec3, PendingChunk<T>>, coor
     pending.remove(&coord).is_some()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn poll_chunk_tasks(
     mut commands: Commands,
     mut manager: ResMut<ChunkManager>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut foliage_materials: ResMut<Assets<ExtendedMaterial<StandardMaterial, FoliageWindMaterial>>>,
+    mut water_materials: ResMut<Assets<WaterMaterial>>,
     mut timings: ResMut<WorldTimings>,
     mut initial_load: ResMut<InitialWorldLoad>,
 ) {
@@ -2043,6 +2204,7 @@ fn poll_chunk_tasks(
             &mut meshes,
             &mut materials,
             &mut foliage_materials,
+            &mut water_materials,
             generated,
         );
         initial_load.mark_loaded(coord);
@@ -2056,6 +2218,7 @@ fn stream_chunks(
     mut manager: ResMut<ChunkManager>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut foliage_materials: ResMut<Assets<ExtendedMaterial<StandardMaterial, FoliageWindMaterial>>>,
+    mut water_materials: ResMut<Assets<WaterMaterial>>,
     generator: Res<WorldGenResource>,
     camera: Single<&GlobalTransform, With<crate::player::PlayerCamera>>,
     player: Single<(&Transform, &Player), With<Player>>,
@@ -2107,7 +2270,7 @@ fn stream_chunks(
                 materials.remove(&h);
             }
             if let Some(h) = manager.water_fade_materials.remove(&coord) {
-                materials.remove(&h);
+                water_materials.remove(&h);
             }
             if let Some(h) = manager.foliage_fade_materials.remove(&coord) {
                 foliage_materials.remove(&h);
@@ -2222,6 +2385,7 @@ fn animate_chunk_fade_in(
     mut fades: Query<(Entity, &mut ChunkFadeIn), With<ChunkEntity>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut foliage_materials: ResMut<Assets<ExtendedMaterial<StandardMaterial, FoliageWindMaterial>>>,
+    mut water_materials: ResMut<Assets<WaterMaterial>>,
 ) {
     let dt = time.delta_secs();
     let mut finished = Vec::new();
@@ -2254,11 +2418,9 @@ fn animate_chunk_fade_in(
             };
         }
         if let Some(handle) = manager.water_fade_materials.get(&coord)
-            && let Some(mut mat) = materials.get_mut(handle)
+            && let Some(mut mat) = water_materials.get_mut(handle)
         {
-            let c = mat.base_color.to_srgba();
-            mat.base_color = Color::srgba(c.red, c.green, c.blue, alpha * 0.72);
-            mat.alpha_mode = AlphaMode::Blend;
+            mat.data.alpha = alpha;
         }
         if let Some(handle) = manager.foliage_fade_materials.get(&coord)
             && let Some(mut mat) = foliage_materials.get_mut(handle)
@@ -2300,7 +2462,7 @@ fn animate_chunk_fade_in(
                 materials.remove(&h);
             }
             if let Some(h) = manager.water_fade_materials.remove(&coord) {
-                materials.remove(&h);
+                water_materials.remove(&h);
             }
             if let Some(h) = manager.foliage_fade_materials.remove(&coord) {
                 foliage_materials.remove(&h);
@@ -2309,6 +2471,104 @@ fn animate_chunk_fade_in(
     }
 }
 
+fn update_foliage_wind_materials(
+    settings: Res<crate::settings::GameSettings>,
+    time: Res<Time>,
+    mut materials: ResMut<Assets<ExtendedMaterial<StandardMaterial, FoliageWindMaterial>>>,
+) {
+    let strength = settings.wind_strength.clamp(0.0, 0.2);
+    let elapsed = time.elapsed_secs_wrapped();
+    for (_, material) in materials.iter_mut() {
+        let params = &mut material.extension.params;
+        if (params.x - strength).abs() > f32::EPSILON {
+            params.x = strength;
+        }
+        params.y = elapsed;
+    }
+}
+
+/// Bevy's default image address mode is `ClampToEdge`. Water samples world-space
+/// UVs far outside `0..1`, so without an explicit repeating sampler nearly every
+/// fragment clamps to the same edge texel and the detail tile effectively
+/// disappears. Set it once as soon as the PNG finishes loading.
+fn configure_water_detail_sampler(manager: Res<ChunkManager>, mut images: ResMut<Assets<Image>>) {
+    let Some(mut image) = images.get_mut(&manager.water_detail_texture) else {
+        return;
+    };
+    let sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+        address_mode_u: ImageAddressMode::Repeat,
+        address_mode_v: ImageAddressMode::Repeat,
+        address_mode_w: ImageAddressMode::Repeat,
+        mag_filter: ImageFilterMode::Nearest,
+        min_filter: ImageFilterMode::Nearest,
+        mipmap_filter: ImageFilterMode::Nearest,
+        ..Default::default()
+    });
+    if image.sampler != sampler {
+        image.sampler = sampler;
+    }
+}
+
+fn update_water_materials(
+    time: Res<Time>,
+    camera: Single<&GlobalTransform, With<crate::player::PlayerCamera>>,
+    cycle: Res<crate::day_night::DayNightCycle>,
+    manager: Res<ChunkManager>,
+    mut water_materials: ResMut<Assets<WaterMaterial>>,
+) {
+    let cam = camera.translation();
+    let t = time.elapsed_secs();
+    let day = cycle.daylight_factor();
+    let night = cycle.night_factor();
+    let twilight = cycle.twilight_factor();
+    let preset = crate::settings::surface_preset_for_cycle(&cycle);
+    let sun_dir = (-cycle.sun_direction()).normalize_or_zero();
+    let moon_dir = (-cycle.moon_direction()).normalize_or_zero();
+    let sun_tint = Vec3::from_array(preset.sun_color);
+    let moon_tint = Vec3::from_array(preset.moon_color);
+
+    // Keep water tied to the shared day/night palette. Night stays dark blue
+    // rather than black so the surface remains readable.
+    let day_deep = Vec3::new(0.04, 0.18, 0.32);
+    let night_deep = Vec3::new(0.008, 0.022, 0.05);
+    let warm_deep = Vec3::new(0.16, 0.08, 0.12);
+    let mut deep = night_deep.lerp(day_deep, day);
+    deep = deep.lerp(warm_deep, twilight * 0.45);
+
+    let day_shallow = Vec3::new(0.16, 0.52, 0.58);
+    let night_shallow = Vec3::new(0.022, 0.055, 0.10);
+    let warm_shallow = Vec3::new(0.42, 0.22, 0.18);
+    let mut shallow = night_shallow.lerp(day_shallow, day);
+    shallow = shallow.lerp(warm_shallow, twilight * 0.45);
+
+    // Both lights are uploaded; the shader scales these strengths by daylight
+    // and night, removing the old hard sun/moon switch at the horizon.
+    let sun_spec = 0.85;
+    let moon_spec = 0.015;
+    let mut seen: std::collections::HashSet<AssetId<WaterMaterial>> =
+        std::collections::HashSet::new();
+    let mut update = |handle: &Handle<WaterMaterial>| {
+        let id = handle.id();
+        if !seen.insert(id) {
+            return;
+        }
+        if let Some(mut mat) = water_materials.get_mut(id) {
+            mat.data.time = t;
+            mat.data.wave_scale = 1.35;
+            mat.data.camera = Vec4::new(cam.x, cam.y, cam.z, 0.0);
+            mat.data.deep_color = deep.extend(mat.data.deep_color.w);
+            mat.data.shallow_color = shallow.extend(mat.data.shallow_color.w);
+            mat.data.sun_dir = Vec4::new(sun_dir.x, sun_dir.y, sun_dir.z, day);
+            mat.data.sun_color = Vec4::new(sun_tint.x, sun_tint.y, sun_tint.z, sun_spec);
+            mat.data.moon_dir = Vec4::new(moon_dir.x, moon_dir.y, moon_dir.z, night);
+            mat.data.moon_color = Vec4::new(moon_tint.x, moon_tint.y, moon_tint.z, moon_spec);
+        }
+    };
+    update(&manager.water_material);
+    for h in manager.water_fade_materials.values() {
+        update(h);
+    }
+}
 fn distance_culling(
     camera: Single<&GlobalTransform, With<crate::player::PlayerCamera>>,
     manager: Res<ChunkManager>,
@@ -2441,6 +2701,7 @@ fn spawn_chunk(
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
     foliage_materials: &mut Assets<ExtendedMaterial<StandardMaterial, FoliageWindMaterial>>,
+    water_materials: &mut Assets<WaterMaterial>,
     mut generated: GeneratedChunk,
 ) {
     // Re-apply this session's edits before the chunk is meshed, so streaming
@@ -2457,7 +2718,7 @@ fn spawn_chunk(
         generated.water_triangles = water.triangle_count();
         generated.opaque = opaque.into_mesh();
         generated.foliage = foliage.into_foliage_mesh();
-        generated.water = water.into_mesh();
+        generated.water = water.into_water_mesh();
     }
 
     let coord = generated.coord;
@@ -2484,14 +2745,13 @@ fn spawn_chunk(
         alpha_mode: AlphaMode::Blend,
         ..default()
     });
-    let water_fade = materials.add(StandardMaterial {
-        base_color: Color::srgba(1.0, 1.0, 1.0, 0.0),
-        perceptual_roughness: 0.12,
-        metallic: 0.0,
-        reflectance: 0.45,
-        cull_mode: None,
-        alpha_mode: AlphaMode::Blend,
-        ..default()
+    let water_fade = water_materials.add(WaterMaterial {
+        data: WaterUniformData {
+            alpha: 0.0,
+            wave_scale: 1.0,
+            ..WaterUniformData::default()
+        },
+        detail_texture: manager.water_detail_texture.clone(),
     });
     let foliage_fade = manager.foliage_material.as_ref().map(|_| {
         foliage_materials.add(ExtendedMaterial {
@@ -2578,7 +2838,6 @@ fn spawn_chunk(
             triangles: generated.triangles,
             foliage_triangles: generated.foliage_triangles,
             water_triangles: generated.water_triangles,
-            fade_remaining: CHUNK_FADE_IN_SECS,
         },
     );
 }
@@ -2620,7 +2879,7 @@ pub fn remesh_chunk(
             chunk.water_entity,
             mesh_data.opaque.into_mesh(),
             mesh_data.foliage.into_foliage_mesh(),
-            mesh_data.water.into_mesh(),
+            mesh_data.water.into_water_mesh(),
             triangles,
             foliage_triangles,
             water_triangles,
@@ -2777,7 +3036,6 @@ mod tests {
                 triangles: 0,
                 water_triangles: 0,
                 foliage_triangles: 0,
-                fade_remaining: 0.0,
             },
         );
     }

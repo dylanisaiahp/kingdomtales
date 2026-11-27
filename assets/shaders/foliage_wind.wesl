@@ -1,9 +1,16 @@
-import bevy_pbr::render::{
-    forward_io::VertexOutput,
-    mesh_functions,
-    mesh_view_bindings::globals,
-    view_transformations::position_world_to_clip,
+import bevy_pbr::{
+    render::forward_io::VertexOutput,
+    render::mesh_functions,
+    render::pbr_functions::pbr_input_from_standard_material,
+    render::pbr_functions::alpha_discard,
+    render::view_transformations::position_world_to_clip,
 };
+
+struct FoliageWindMaterial {
+    params: vec4<f32>, // x = wind strength, y = elapsed time
+};
+
+@group(3) @binding(100) var<uniform> wind: FoliageWindMaterial;
 
 struct Vertex {
     @builtin(instance_index) instance_index: u32,
@@ -30,22 +37,25 @@ fn vertex(vertex: Vertex) -> VertexOutput {
         vec4<f32>(vertex.position, 1.0),
     );
 
-    // Coherent sway: snap phase to a coarse grid so nearby foliage moves together,
-    // preventing gaps between adjacent leaf cells. Bottom vertices have weight 0.
-    let wind_strength = 0.03;
-    let wind_speed = 1.1;
-    let wind_scale = 0.35;
+    // Continuous world-space wind field. Displacement depends only on undeformed
+    // world position + vertex wind weight, so vertices sharing the same world
+    // position (including chunk/block boundaries) move together and do not seam.
+    let wind_strength = wind.params.x;
+    let wind_speed = 1.15;
+    let t = wind.params.y * wind_speed;
+    let wp = world_position.xz;
 
-    let t = globals.time * wind_speed;
-    let cell = floor(world_position.xz / 3.0);
-    let phase = dot(cell, vec2<f32>(0.37, 0.61)) * wind_scale;
-    let sway = sin(t + phase) + 0.35 * sin(t * 1.6 + phase * 1.2);
-    let gust = sin(t * 0.22 + cell.x * 0.11 + cell.y * 0.09);
-    let amount = (sway * 0.75 + gust * 0.25) * wind_strength * vertex.wind_weight;
+    // Layered continuous sin waves give coherent sway with natural variation.
+    let sway_a = sin(t + wp.x * 0.55 + wp.y * 0.35);
+    let sway_b = sin(t * 1.37 + wp.x * 0.21 - wp.y * 0.46 + 1.7);
+    let sway_c = sin(t * 0.73 - wp.x * 0.18 + wp.y * 0.63 + 0.4);
+    let gust = sin(t * 0.23 + wp.x * 0.07 + wp.y * 0.05);
+    let sway = sway_a * 0.55 + sway_b * 0.30 + sway_c * 0.15;
+    let amount = (sway * 0.78 + gust * 0.22) * wind_strength * vertex.wind_weight;
 
     var displaced = world_position;
     displaced.x += amount;
-    displaced.z += amount * 0.55;
+    displaced.z += amount * 0.62 + sway_b * 0.012 * vertex.wind_weight;
 
     out.world_position = displaced;
     out.position = position_world_to_clip(displaced.xyz);

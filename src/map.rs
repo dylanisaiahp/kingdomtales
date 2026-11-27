@@ -1,15 +1,17 @@
-//! 3D overhead world map (Phase 1).
+//! Overhead world map (Live 3D / Explore 2D).
 //!
-//! Press M to open a north-up overhead view rendered by a dedicated camera into
-//! an offscreen texture displayed in a UI overlay. The map reuses the existing
-//! loaded world/chunk rendering; it does not create world data.
+//! Press M to open the map. Live renders a north-up 3D view with a dedicated
+//! camera into an offscreen texture; Explore uses CPU-composited snapshots.
+//! Neither mode mutates world chunks.
 //!
-//! Controls while open: drag to pan, scroll to zoom, click/press Recenter to
-//! return to the player. Esc closes the map. Fog of war/persistence is Phase 2.
+//! Controls while open: drag to pan, scroll to zoom, C/Home recenters,
+//! Tab switches Live/Explore, and M/Esc closes. Explore fog is persisted via
+//! `map_explored` records.
 
 use std::collections::{HashMap, HashSet};
 
 use bevy::asset::RenderAssetUsages;
+use bevy::camera::visibility::RenderLayers;
 use bevy::camera::{Camera, Camera3d, ClearColorConfig, RenderTarget};
 use bevy::input::mouse::AccumulatedMouseScroll;
 use bevy::math::Rot2;
@@ -151,7 +153,8 @@ impl Default for MapState {
     }
 }
 
-/// Persistent explored-map data (Phase 2). Independent of loaded chunks.
+/// Persistent explored-map data, serialized via `map_explored` records.
+/// Independent of loaded chunks.
 #[derive(Resource, Default)]
 pub struct MapExploration {
     /// Explored cells in exploration-grid coordinates.
@@ -743,7 +746,8 @@ fn build_snapshot_flora(
             continue;
         }
         any_loaded = true;
-        // Actual loaded chunk voxel projection into 0.5m raster. Captures player modifications.
+        // Actual loaded chunk voxel projection into the 0.25 m flora raster.
+        // Captures player modifications.
         for lz in 0..CHUNK_Z {
             for lx in 0..CHUNK_X {
                 let wx_detail = cminx + lx as i32;
@@ -988,6 +992,9 @@ fn setup_map_ui(mut commands: Commands, theme: Res<UiTheme>, state: Res<MapState
         Name::new("MapCamera"),
         MapCamera,
         Camera3d::default(),
+        // Keep the sky dome out of the Live map. The clear color is transparent,
+        // so only terrain, flora, and clouds appear in the offscreen texture.
+        RenderLayers::layer(0),
         Camera {
             order: -10,
             is_active: false,
@@ -1215,7 +1222,7 @@ fn setup_map_ui(mut commands: Commands, theme: Res<UiTheme>, state: Res<MapState
     ));
 
     // Player marker: rounded triangle/arrowhead, rotated to facing direction.
-    // 0 rotation points "forward" via the sharp bottom-right corner after -45deg offset.
+    // 0 rotation points "forward" via the sharp bottom-right corner after -135deg offset.
     commands.spawn((
         MapPlayerMarker,
         Node {

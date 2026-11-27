@@ -1,9 +1,7 @@
-//! Procedural UI icons generated from small pixel patterns.
-//!
-//! Items, notification tones, and HUD symbols are drawn from code as small
-//! nearest-filtered RGBA textures at startup, so the game needs no external art
-//! assets. The palette is tuned to the clean slate/gold UI direction while
-//! keeping each symbol readable and distinct.
+//! UI icons: 32x32 pixel-art PNG assets for item icons and HUD weather icons,
+//! with procedural icons for the remaining HUD symbols and notification tones
+//! until they are migrated too. All icons use nearest-neighbor filtering for
+//! crisp pixel art.
 
 use bevy::asset::RenderAssetUsages;
 use bevy::image::ImageSampler;
@@ -25,16 +23,20 @@ pub enum HudIcon {
     Stamina,
     Insight,
     Sort,
+    WeatherDay,
+    WeatherNight,
 }
 
 impl HudIcon {
-    pub const ALL: [HudIcon; 6] = [
+    pub const ALL: [HudIcon; 8] = [
         HudIcon::Portrait,
         HudIcon::Hunger,
         HudIcon::Thirst,
         HudIcon::Stamina,
         HudIcon::Insight,
         HudIcon::Sort,
+        HudIcon::WeatherDay,
+        HudIcon::WeatherNight,
     ];
 
     #[inline]
@@ -47,6 +49,8 @@ impl HudIcon {
             HudIcon::Stamina => 3,
             HudIcon::Insight => 4,
             HudIcon::Sort => 5,
+            HudIcon::WeatherDay => 6,
+            HudIcon::WeatherNight => 7,
         }
     }
 }
@@ -56,15 +60,20 @@ impl HudIcon {
 pub struct UiIcons {
     items: [Handle<Image>; 40],
     tones: [Handle<Image>; 5],
-    hud: [Handle<Image>; 6],
+    hud: [Handle<Image>; 8],
 }
 
 impl FromWorld for UiIcons {
     fn from_world(world: &mut World) -> Self {
+        let asset_server = world.resource::<AssetServer>().clone();
         let mut images = world.resource_mut::<Assets<Image>>();
         let items = std::array::from_fn(|index| {
             let item = ItemId::ALL[index];
-            images.add(build_icon(item_pattern(item), item_tint(item)))
+            if let Some(path) = item_icon_asset(item) {
+                asset_server.load(path)
+            } else {
+                images.add(build_icon(item_pattern(item), item_tint(item)))
+            }
         });
         let tones = std::array::from_fn(|index| {
             let tone = NotificationTone::ALL[index];
@@ -72,9 +81,66 @@ impl FromWorld for UiIcons {
         });
         let hud = std::array::from_fn(|index| {
             let icon = HudIcon::ALL[index];
-            images.add(build_icon(hud_pattern(icon), None))
+            if let Some(path) = hud_icon_asset(icon) {
+                asset_server.load(path)
+            } else {
+                images.add(build_icon(hud_pattern(icon), None))
+            }
         });
         Self { items, tones, hud }
+    }
+}
+
+fn item_icon_asset(item: ItemId) -> Option<&'static str> {
+    match item {
+        ItemId::Turf => Some("ui/icons/items/turf.png"),
+        ItemId::Topsoil => Some("ui/icons/items/topsoil.png"),
+        ItemId::Sand => Some("ui/icons/items/sand.png"),
+        ItemId::Snow => Some("ui/icons/items/snow.png"),
+        ItemId::Wood => Some("ui/icons/items/wood.png"),
+        ItemId::Leaves => Some("ui/icons/items/leaves.png"),
+        ItemId::Stick => Some("ui/icons/items/stick.png"),
+        ItemId::Fiber => Some("ui/icons/items/fiber.png"),
+        ItemId::Clay => Some("ui/icons/items/clay.png"),
+        ItemId::Berry => Some("ui/icons/items/berry.png"),
+        ItemId::IronOre => Some("ui/icons/items/iron_ore.png"),
+        ItemId::Granite => Some("ui/icons/items/granite.png"),
+        ItemId::Slate => Some("ui/icons/items/slate.png"),
+        ItemId::Shale => Some("ui/icons/items/shale.png"),
+        ItemId::Sandstone => Some("ui/icons/items/sandstone.png"),
+        ItemId::Limestone => Some("ui/icons/items/limestone.png"),
+        ItemId::GranitePebble => Some("ui/icons/items/granite_pebble.png"),
+        ItemId::SlatePebble => Some("ui/icons/items/slate_pebble.png"),
+        ItemId::SandstonePebble => Some("ui/icons/items/sandstone_pebble.png"),
+        ItemId::LimestonePebble => Some("ui/icons/items/limestone_pebble.png"),
+        ItemId::Hammer => Some("ui/icons/items/hammer.png"),
+        ItemId::Wrench => Some("ui/icons/items/wrench.png"),
+        ItemId::Pickaxe => Some("ui/icons/items/pickaxe.png"),
+        ItemId::Axe => Some("ui/icons/items/axe.png"),
+        ItemId::Shovel => Some("ui/icons/items/shovel.png"),
+        ItemId::Hoe => Some("ui/icons/items/hoe.png"),
+        ItemId::Scythe => Some("ui/icons/items/scythe.png"),
+        ItemId::Lantern => Some("ui/icons/items/lantern.png"),
+        ItemId::Magnet => Some("ui/icons/items/magnet.png"),
+        ItemId::Humus => Some("ui/icons/items/humus.png"),
+        ItemId::RedSandstone => Some("ui/icons/items/red_sandstone.png"),
+        ItemId::SharpenedStone => Some("ui/icons/items/sharpened_stone.png"),
+        ItemId::StoneTippedStick => Some("ui/icons/items/stone_tipped_stick.png"),
+        ItemId::Cordage => Some("ui/icons/items/cordage.png"),
+        ItemId::StoneHandAxe => Some("ui/icons/items/stone_hand_axe.png"),
+        ItemId::BarkScraper => Some("ui/icons/items/bark_scraper.png"),
+        ItemId::SmallStoneHammer => Some("ui/icons/items/small_stone_hammer.png"),
+        ItemId::Bark => Some("ui/icons/items/bark.png"),
+        ItemId::Workbench => Some("ui/icons/items/workbench.png"),
+        ItemId::Furnace => Some("ui/icons/items/furnace.png"),
+    }
+}
+
+fn hud_icon_asset(icon: HudIcon) -> Option<&'static str> {
+    match icon {
+        HudIcon::WeatherDay => Some("ui/icons/hud/weather_day.png"),
+        HudIcon::WeatherNight => Some("ui/icons/hud/weather_night.png"),
+        _ => None,
     }
 }
 
@@ -250,6 +316,8 @@ fn hud_pattern(icon: HudIcon) -> Pattern {
         HudIcon::Stamina => HUD_STAMINA,
         HudIcon::Insight => HUD_INSIGHT,
         HudIcon::Sort => HUD_SORT,
+        HudIcon::WeatherDay => HUD_WEATHER_DAY,
+        HudIcon::WeatherNight => HUD_WEATHER_NIGHT,
     }
 }
 
@@ -342,6 +410,36 @@ const HUD_SORT: Pattern = [
     "....WWWW....",
     "....AAAA....",
     ".....AA.....",
+    "............",
+];
+
+const HUD_WEATHER_DAY: Pattern = [
+    "....AAAA....",
+    "....AaaA....",
+    "..A.AaaA.A..",
+    "AA..AaaA..AA",
+    ".AA.AaaA.AA.",
+    "..AAaaaaAA..",
+    "..AAaaaaAA..",
+    ".AA.AaaA.AA.",
+    "AA..AaaA..AA",
+    "..A.AaaA.A..",
+    "....AaaA....",
+    "....AAAA....",
+];
+
+const HUD_WEATHER_NIGHT: Pattern = [
+    "....CCCC....",
+    "...CccccC...",
+    "..CccccccC..",
+    "..CcccC..C..",
+    ".CcccC....C.",
+    ".CcccC....C.",
+    ".CcccC....C.",
+    "..CcccC..C..",
+    "..CccccccC..",
+    "...CccccC...",
+    "....CCCC....",
     "............",
 ];
 
@@ -1060,6 +1158,18 @@ mod tests {
         for icon in HudIcon::ALL {
             assert_pattern(hud_pattern(icon), &format!("{icon:?}"));
         }
+    }
+
+    #[test]
+    fn weather_icons_use_generated_png_assets() {
+        for icon in [HudIcon::WeatherDay, HudIcon::WeatherNight] {
+            let path = hud_icon_asset(icon).expect("weather icons have PNG assets");
+            assert!(
+                std::path::Path::new("assets").join(path).is_file(),
+                "{path} is missing"
+            );
+        }
+        assert!(hud_icon_asset(HudIcon::Portrait).is_none());
     }
 
     #[test]

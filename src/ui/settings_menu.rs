@@ -4,8 +4,10 @@
 //! presentation. "Settings" opens this module's tabbed panel; the pause menu
 //! itself only offers Resume, Settings and Quit. All buttons use Bevy 0.20's
 //! `Button` widget with an `Activate` observer, while numeric settings use the
-//! `Slider` widget. Audio and Map tabs are deliberately reserved UI placeholders.
+//! `Slider` widget. The Keybinds tab captures the next key press and swaps
+//! conflicting assignments so every action keeps a unique key.
 
+use bevy::ecs::system::SystemParam;
 use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
 use bevy::ui::ComputedNode;
@@ -16,21 +18,24 @@ use bevy::ui_widgets::{
 };
 
 use crate::settings::{
-    DEFAULT_MOUSE_SENSITIVITY, GameSettings, InputBindings, MAX_FOV_DEGREES, MAX_RENDER_DISTANCE,
-    MAX_SENSITIVITY_MULTIPLIER, MIN_FOV_DEGREES, MIN_RENDER_DISTANCE, MIN_SENSITIVITY_MULTIPLIER,
-    MenuState, estimated_chunk_memory_mb,
+    BindingAction, DEFAULT_MOUSE_SENSITIVITY, GameSettings, InputBindings, KeybindCapture,
+    MAX_FOV_DEGREES, MAX_RENDER_DISTANCE, MAX_SENSITIVITY_MULTIPLIER, MIN_FOV_DEGREES,
+    MIN_RENDER_DISTANCE, MIN_SENSITIVITY_MULTIPLIER, MenuState, estimated_chunk_memory_mb,
 };
-use crate::ui::theme::{UiTheme, display_if, key_label, spawn_keycap, spawn_panel, spawn_text};
+use crate::ui::theme::{UiTheme, display_if, key_label, spawn_panel, spawn_text};
 use crate::ui_manager::{Overlay, UiManager};
 
 const SLIDER_WIDTH: f32 = 190.0;
 const SLIDER_HEIGHT: f32 = 20.0;
 const THUMB_SIZE: f32 = 14.0;
 const VALUE_WIDTH: f32 = 78.0;
-const TAB_WIDTH: f32 = 116.0;
 const SETTINGS_PADDING_X: f32 = 36.0;
 const SETTINGS_PADDING_Y: f32 = 24.0;
-const SETTINGS_CONTENT_WIDTH: f32 = 760.0;
+const SETTINGS_SIDEBAR_WIDTH: f32 = 208.0;
+const SETTINGS_TAB_WIDTH: f32 = 156.0;
+const SETTINGS_ROW_WIDTH: f32 = 720.0;
+const SETTINGS_CONTENT_WIDTH: f32 = 980.0;
+const KEYBIND_CARD_WIDTH: f32 = 300.0;
 
 /// Ordered alongside the other UI chains so shared `Node`/`Text` access is
 /// deterministic.
@@ -58,29 +63,32 @@ struct TabPanel(SettingsTab);
 #[derive(Resource, Clone, Copy, PartialEq, Eq, Debug, Default)]
 enum SettingsTab {
     #[default]
-    Video,
-    Audio,
+    Graphics,
+    Lighting,
+    Color,
     Mouse,
-    Controls,
-    Map,
+    Keybinds,
+    Audio,
 }
 
 impl SettingsTab {
-    const ALL: [Self; 5] = [
-        Self::Video,
-        Self::Audio,
+    const ALL: [Self; 6] = [
+        Self::Graphics,
+        Self::Lighting,
+        Self::Color,
         Self::Mouse,
-        Self::Controls,
-        Self::Map,
+        Self::Keybinds,
+        Self::Audio,
     ];
 
     fn label(self) -> &'static str {
         match self {
-            Self::Video => "Video",
-            Self::Audio => "Audio",
+            Self::Graphics => "Graphics",
+            Self::Lighting => "Lighting",
+            Self::Color => "Color",
             Self::Mouse => "Mouse",
-            Self::Controls => "Controls",
-            Self::Map => "Map",
+            Self::Keybinds => "Keybinds",
+            Self::Audio => "Audio",
         }
     }
 }
@@ -90,7 +98,13 @@ enum SettingsAction {
     ToggleVsync,
     ToggleFullscreen,
     TogglePerfLog,
+    ToggleClouds,
+    CycleLightShafts,
+    CycleTonemapping,
+    CycleSsao,
+    CycleBloom,
     CycleShadows,
+    Rebind(BindingAction),
     ResetDefaults,
     Resume,
     OpenSettings,
@@ -105,6 +119,11 @@ enum SettingsSlider {
     Sensitivity,
     Fov,
     RenderDistance,
+    Exposure,
+    Saturation,
+    Contrast,
+    Temperature,
+    WindStrength,
 }
 
 impl SettingsSlider {
@@ -115,19 +134,34 @@ impl SettingsSlider {
             SettingsSlider::RenderDistance => {
                 (MIN_RENDER_DISTANCE as f32, MAX_RENDER_DISTANCE as f32)
             }
+            SettingsSlider::Exposure => (-2.0, 2.0),
+            SettingsSlider::Saturation => (0.5, 1.5),
+            SettingsSlider::Contrast => (0.8, 1.3),
+            SettingsSlider::Temperature => (-0.5, 0.5),
+            SettingsSlider::WindStrength => (0.0, 0.2),
         }
     }
 
     fn step(self) -> f32 {
         match self {
-            SettingsSlider::Sensitivity => 0.1,
+            SettingsSlider::Sensitivity
+            | SettingsSlider::Saturation
+            | SettingsSlider::Contrast
+            | SettingsSlider::Temperature
+            | SettingsSlider::WindStrength => 0.05,
+            SettingsSlider::Exposure => 0.1,
             SettingsSlider::Fov | SettingsSlider::RenderDistance => 1.0,
         }
     }
 
     fn precision(self) -> i32 {
         match self {
-            SettingsSlider::Sensitivity => 1,
+            SettingsSlider::Sensitivity
+            | SettingsSlider::Exposure
+            | SettingsSlider::Saturation
+            | SettingsSlider::Contrast
+            | SettingsSlider::Temperature
+            | SettingsSlider::WindStrength => 2,
             SettingsSlider::Fov | SettingsSlider::RenderDistance => 0,
         }
     }
@@ -137,6 +171,11 @@ impl SettingsSlider {
             SettingsSlider::Sensitivity => settings.mouse_sensitivity / DEFAULT_MOUSE_SENSITIVITY,
             SettingsSlider::Fov => settings.fov_degrees,
             SettingsSlider::RenderDistance => settings.render_distance as f32,
+            SettingsSlider::Exposure => settings.exposure_ev,
+            SettingsSlider::Saturation => settings.saturation,
+            SettingsSlider::Contrast => settings.contrast,
+            SettingsSlider::Temperature => settings.temperature,
+            SettingsSlider::WindStrength => settings.wind_strength,
         }
     }
 }
@@ -144,6 +183,44 @@ impl SettingsSlider {
 /// Marks the thumb of a settings slider so it can follow the value.
 #[derive(Component)]
 struct SettingsThumb;
+
+/// Sidebar tab button, styled from the active tab resource.
+#[derive(Component, Clone, Copy)]
+struct SettingsTabButton(SettingsTab);
+
+/// A keybind card button; highlighted while it is waiting for a key.
+#[derive(Component, Clone, Copy)]
+struct BindingButton(BindingAction);
+
+/// Text showing the key assigned to a rebindable action.
+#[derive(Component, Clone, Copy)]
+struct BindingValue(BindingAction);
+
+type TabButtonQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static SettingsTabButton,
+        &'static Hovered,
+        Has<Pressed>,
+        &'static mut BackgroundColor,
+        &'static mut BorderColor,
+    ),
+    With<MenuButton>,
+>;
+
+type BindingButtonQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static BindingButton,
+        &'static Hovered,
+        Has<Pressed>,
+        &'static mut BackgroundColor,
+        &'static mut BorderColor,
+    ),
+    With<MenuButton>,
+>;
 
 /// Text that displays a setting's current value.
 #[derive(Component, Clone, Copy, Debug)]
@@ -155,6 +232,16 @@ enum SettingsValue {
     Vsync,
     Fullscreen,
     PerfLog,
+    Clouds,
+    LightShaftsMode,
+    Tonemapping,
+    Exposure,
+    Saturation,
+    Contrast,
+    Temperature,
+    WindStrength,
+    Ssao,
+    Bloom,
 }
 
 /// The RAM hint under the render-distance slider.
@@ -174,11 +261,15 @@ impl Plugin for SettingsMenuPlugin {
                 (
                     sync_menu_visibility,
                     sync_tab_panels,
+                    capture_keybind,
                     sync_slider_values,
                     sync_slider_thumbs,
                     update_values,
+                    update_binding_values,
                     update_ram_hint,
                     style_buttons,
+                    style_tab_buttons,
+                    style_binding_buttons,
                     style_slider_thumbs,
                 )
                     .chain()
@@ -318,37 +409,42 @@ fn setup_settings_menu(
                 width: Val::Percent(100.0),
                 height: Val::Percent(100.0),
                 display: Display::None,
+                // Bevy defaults to a row. Without an explicit column, the
+                // header/body/footer are laid out horizontally and the body is
+                // squeezed off screen, leaving only the header text visible.
+                flex_direction: FlexDirection::Column,
                 overflow: Overflow::clip(),
+                border_radius: BorderRadius::all(Val::Px(0.0)),
                 ..default()
             },
-            BackgroundColor(theme.colors.settings_scrim),
+            BackgroundColor(theme.colors.settings_panel_bg),
             GlobalZIndex(theme.layers.settings),
         ))
         .id();
 
-    let panel = spawn_panel(
-        commands,
-        theme,
-        root,
-        Node {
-            width: Val::Percent(100.0),
-            height: Val::Percent(100.0),
-            padding: UiRect::axes(Val::Px(SETTINGS_PADDING_X), Val::Px(SETTINGS_PADDING_Y)),
-            flex_direction: FlexDirection::Column,
-            row_gap: Val::Px(12.0),
-            overflow: Overflow::clip(),
-            border: theme.shape.border(),
-            border_radius: theme.shape.rounded(),
-            ..default()
-        },
-        theme.colors.settings_panel_bg,
-        theme.colors.panel_border,
-    );
-
+    let header = commands
+        .spawn((
+            Node {
+                width: Val::Percent(100.0),
+                min_height: Val::Px(78.0),
+                padding: UiRect::axes(
+                    Val::Px(SETTINGS_PADDING_X),
+                    Val::Px(SETTINGS_PADDING_Y * 0.65),
+                ),
+                flex_direction: FlexDirection::Column,
+                justify_content: JustifyContent::Center,
+                row_gap: Val::Px(3.0),
+                flex_shrink: 0.0,
+                ..default()
+            },
+            BackgroundColor(theme.colors.panel_bg_strong),
+            ChildOf(root),
+        ))
+        .id();
     spawn_text(
         commands,
         theme,
-        panel,
+        header,
         "SETTINGS",
         theme.fonts.title,
         theme.colors.text,
@@ -357,80 +453,157 @@ fn setup_settings_menu(
     spawn_text(
         commands,
         theme,
-        panel,
+        header,
+        "Tune the game to your setup. Changes apply immediately.",
+        theme.fonts.small,
+        theme.colors.muted_text,
+        StaticLabel,
+    );
+
+    let body = commands
+        .spawn((
+            Node {
+                width: Val::Percent(100.0),
+                min_height: Val::Px(0.0),
+                flex_grow: 1.0,
+                flex_direction: FlexDirection::Row,
+                overflow: Overflow::clip(),
+                ..default()
+            },
+            ChildOf(root),
+        ))
+        .id();
+
+    let sidebar = commands
+        .spawn((
+            Node {
+                width: Val::Px(SETTINGS_SIDEBAR_WIDTH),
+                min_width: Val::Px(SETTINGS_SIDEBAR_WIDTH),
+                padding: UiRect {
+                    left: Val::Px(SETTINGS_PADDING_X),
+                    right: Val::Px(16.0),
+                    top: Val::Px(18.0),
+                    bottom: Val::Px(18.0),
+                },
+                flex_direction: FlexDirection::Column,
+                row_gap: Val::Px(6.0),
+                border: UiRect {
+                    right: Val::Px(1.0),
+                    ..default()
+                },
+                ..default()
+            },
+            BackgroundColor(theme.colors.panel_bg_soft),
+            BorderColor::all(theme.colors.faint_border),
+            ChildOf(body),
+        ))
+        .id();
+
+    spawn_text(
+        commands,
+        theme,
+        sidebar,
+        "CATEGORIES",
+        theme.fonts.micro,
+        theme.colors.muted_text,
+        StaticLabel,
+    );
+    for kind in SettingsTab::ALL {
+        let button = spawn_menu_button(
+            commands,
+            sidebar,
+            kind.label(),
+            SETTINGS_TAB_WIDTH,
+            38.0,
+            SettingsAction::SelectTab(kind),
+            theme,
+        );
+        commands.entity(button).insert(SettingsTabButton(kind));
+    }
+
+    let content = commands
+        .spawn((
+            Node {
+                min_width: Val::Px(0.0),
+                max_width: Val::Px(SETTINGS_CONTENT_WIDTH),
+                flex_grow: 1.0,
+                flex_shrink: 1.0,
+                padding: UiRect {
+                    left: Val::Px(28.0),
+                    right: Val::Px(SETTINGS_PADDING_X),
+                    top: Val::Px(20.0),
+                    bottom: Val::Px(20.0),
+                },
+                flex_direction: FlexDirection::Column,
+                row_gap: Val::Px(8.0),
+                overflow: Overflow::clip(),
+                ..default()
+            },
+            ChildOf(body),
+        ))
+        .id();
+
+    let graphics = spawn_tab_panel(commands, content, SettingsTab::Graphics, active_tab);
+    setup_graphics_tab(commands, graphics, settings, theme);
+
+    let lighting = spawn_tab_panel(commands, content, SettingsTab::Lighting, active_tab);
+    setup_lighting_tab(commands, lighting, settings, theme);
+
+    let color = spawn_tab_panel(commands, content, SettingsTab::Color, active_tab);
+    setup_color_tab(commands, color, settings, theme);
+
+    let mouse = spawn_tab_panel(commands, content, SettingsTab::Mouse, active_tab);
+    setup_mouse_tab(commands, mouse, settings, theme);
+
+    let keybinds = spawn_tab_panel(commands, content, SettingsTab::Keybinds, active_tab);
+    setup_keybinds_tab(commands, keybinds, bindings, theme);
+
+    let audio = spawn_tab_panel(commands, content, SettingsTab::Audio, active_tab);
+    setup_audio_tab(commands, audio, theme);
+
+    let footer = commands
+        .spawn((
+            Node {
+                width: Val::Percent(100.0),
+                min_height: Val::Px(62.0),
+                padding: UiRect::axes(
+                    Val::Px(SETTINGS_PADDING_X),
+                    Val::Px(SETTINGS_PADDING_Y * 0.6),
+                ),
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::SpaceBetween,
+                column_gap: Val::Px(10.0),
+                flex_shrink: 0.0,
+                border: UiRect {
+                    top: Val::Px(1.0),
+                    ..default()
+                },
+                ..default()
+            },
+            BackgroundColor(theme.colors.panel_bg_strong),
+            BorderColor::all(theme.colors.faint_border),
+            ChildOf(root),
+        ))
+        .id();
+
+    spawn_text(
+        commands,
+        theme,
+        footer,
         "Esc returns to the pause menu",
         theme.fonts.small,
         theme.colors.muted_text,
         StaticLabel,
     );
 
-    let tabs = commands
-        .spawn((
-            Node {
-                width: Val::Percent(100.0),
-                justify_content: JustifyContent::Center,
-                column_gap: Val::Px(8.0),
-                ..default()
-            },
-            ChildOf(panel),
-        ))
-        .id();
-
-    for kind in SettingsTab::ALL {
-        spawn_menu_button(
-            commands,
-            tabs,
-            kind.label(),
-            TAB_WIDTH,
-            36.0,
-            SettingsAction::SelectTab(kind),
-            theme,
-        );
-    }
-
-    let content = commands
-        .spawn((
-            Node {
-                width: Val::Percent(100.0),
-                max_width: Val::Px(SETTINGS_CONTENT_WIDTH),
-                min_height: Val::Px(0.0),
-                flex_grow: 1.0,
-                flex_shrink: 1.0,
-                align_self: AlignSelf::Center,
-                flex_direction: FlexDirection::Column,
-                row_gap: Val::Px(7.0),
-                overflow: Overflow::clip(),
-                ..default()
-            },
-            ChildOf(panel),
-        ))
-        .id();
-
-    let video = spawn_tab_panel(commands, content, SettingsTab::Video, active_tab);
-    setup_video_tab(commands, video, settings, theme);
-
-    let audio = spawn_tab_panel(commands, content, SettingsTab::Audio, active_tab);
-    setup_audio_tab(commands, audio, theme);
-
-    let mouse = spawn_tab_panel(commands, content, SettingsTab::Mouse, active_tab);
-    setup_mouse_tab(commands, mouse, settings, theme);
-
-    let controls = spawn_tab_panel(commands, content, SettingsTab::Controls, active_tab);
-    setup_controls_tab(commands, controls, bindings, theme);
-
-    let map = spawn_tab_panel(commands, content, SettingsTab::Map, active_tab);
-    setup_map_tab(commands, map, bindings, theme);
-
     let actions = commands
         .spawn((
             Node {
-                width: Val::Percent(100.0),
-                justify_content: JustifyContent::SpaceBetween,
+                flex_direction: FlexDirection::Row,
                 column_gap: Val::Px(8.0),
-                flex_shrink: 0.0,
                 ..default()
             },
-            ChildOf(panel),
+            ChildOf(footer),
         ))
         .id();
 
@@ -487,7 +660,13 @@ fn spawn_tab_panel(
         .id()
 }
 
-fn setup_video_tab(commands: &mut Commands, tab: Entity, settings: &GameSettings, theme: &UiTheme) {
+fn setup_graphics_tab(
+    commands: &mut Commands,
+    tab: Entity,
+    settings: &GameSettings,
+    theme: &UiTheme,
+) {
+    spawn_section_heading(commands, tab, "VIEW", theme);
     spawn_slider_row(
         commands,
         tab,
@@ -515,26 +694,23 @@ fn setup_video_tab(commands: &mut Commands, tab: Entity, settings: &GameSettings
         theme.colors.muted_text,
         SettingsHint,
     );
-    commands
-        .entity(hint)
-        .insert(TextLayout::justify(Justify::Left));
+    commands.entity(hint).insert((
+        TextLayout::justify(Justify::Left),
+        Node {
+            width: Val::Percent(100.0),
+            max_width: Val::Px(SETTINGS_ROW_WIDTH),
+            flex_shrink: 0.0,
+            ..default()
+        },
+    ));
 
-    spawn_toggle_row(
-        commands,
-        tab,
-        "Shadows",
-        settings.shadow_quality.label(),
-        120.0,
-        SettingsAction::CycleShadows,
-        SettingsValue::Shadows,
-        theme,
-    );
+    spawn_section_heading(commands, tab, "DISPLAY", theme);
     spawn_toggle_row(
         commands,
         tab,
         "VSync",
         "Off",
-        80.0,
+        90.0,
         SettingsAction::ToggleVsync,
         SettingsValue::Vsync,
         theme,
@@ -544,7 +720,7 @@ fn setup_video_tab(commands: &mut Commands, tab: Entity, settings: &GameSettings
         tab,
         "Fullscreen",
         "On",
-        80.0,
+        90.0,
         SettingsAction::ToggleFullscreen,
         SettingsValue::Fullscreen,
         theme,
@@ -554,71 +730,177 @@ fn setup_video_tab(commands: &mut Commands, tab: Entity, settings: &GameSettings
         tab,
         "Perf log (1 Hz)",
         "Off",
-        80.0,
+        90.0,
         SettingsAction::TogglePerfLog,
         SettingsValue::PerfLog,
-        theme,
-    );
-
-    spawn_divider(commands, tab, theme);
-    spawn_note(
-        commands,
-        tab,
-        "Esc returns to the pause menu. Changes apply immediately.",
-        theme.fonts.slot_count,
-        theme.colors.muted_text,
         theme,
     );
     if std::env::var_os("WAYLAND_DISPLAY").is_some() {
         spawn_note(
             commands,
             tab,
-            "Note: Wayland syncs every frame to the monitor, so VSync Off is ignored.",
+            "Wayland syncs every frame to the monitor, so VSync Off is ignored here.",
             theme.fonts.small,
             theme.colors.muted_text,
             theme,
         );
     }
+
+    spawn_section_heading(commands, tab, "WORLD", theme);
+    spawn_toggle_row(
+        commands,
+        tab,
+        "Clouds",
+        "On",
+        90.0,
+        SettingsAction::ToggleClouds,
+        SettingsValue::Clouds,
+        theme,
+    );
+    spawn_slider_row(
+        commands,
+        tab,
+        "Wind strength",
+        SettingsSlider::WindStrength,
+        SettingsValue::WindStrength,
+        settings,
+        theme,
+    );
 }
 
-fn setup_audio_tab(commands: &mut Commands, tab: Entity, theme: &UiTheme) {
-    spawn_text(
+fn setup_lighting_tab(
+    commands: &mut Commands,
+    tab: Entity,
+    settings: &GameSettings,
+    theme: &UiTheme,
+) {
+    spawn_section_heading(commands, tab, "SHADOWS & OCCLUSION", theme);
+    spawn_toggle_row(
         commands,
-        theme,
         tab,
-        "AUDIO",
-        theme.fonts.compass,
-        theme.colors.accent,
-        StaticLabel,
+        "Shadow quality",
+        settings.shadow_quality.label(),
+        130.0,
+        SettingsAction::CycleShadows,
+        SettingsValue::Shadows,
+        theme,
+    );
+    spawn_toggle_row(
+        commands,
+        tab,
+        "SSAO",
+        "Unavailable",
+        140.0,
+        SettingsAction::CycleSsao,
+        SettingsValue::Ssao,
+        theme,
     );
     spawn_note(
         commands,
         tab,
-        "Audio controls are reserved for a future milestone.",
-        theme.fonts.body,
+        "SSAO is unavailable in this build due an unresolved rendering regression. The setting is preserved but cannot be activated.",
+        theme.fonts.small,
         theme.colors.muted_text,
         theme,
     );
+
+    spawn_section_heading(commands, tab, "SUN & ATMOSPHERE", theme);
+    spawn_toggle_row(
+        commands,
+        tab,
+        "Light shafts",
+        "Simple",
+        180.0,
+        SettingsAction::CycleLightShafts,
+        SettingsValue::LightShaftsMode,
+        theme,
+    );
     spawn_note(
         commands,
         tab,
-        "No volume settings are active in this build.",
-        theme.fonts.slot_count,
+        "Simple shafts work without a depth prepass. Detailed uses depth-prepass occlusion, forces MSAA Off, and may show artifacts around transparent effects.",
+        theme.fonts.small,
+        theme.colors.muted_text,
+        theme,
+    );
+    spawn_toggle_row(
+        commands,
+        tab,
+        "Bloom",
+        "Low",
+        120.0,
+        SettingsAction::CycleBloom,
+        SettingsValue::Bloom,
+        theme,
+    );
+}
+
+fn setup_color_tab(commands: &mut Commands, tab: Entity, settings: &GameSettings, theme: &UiTheme) {
+    spawn_section_heading(commands, tab, "TONE MAPPING", theme);
+    spawn_toggle_row(
+        commands,
+        tab,
+        "Tonemapping",
+        "TonyMcMapface",
+        170.0,
+        SettingsAction::CycleTonemapping,
+        SettingsValue::Tonemapping,
+        theme,
+    );
+
+    spawn_section_heading(commands, tab, "COLOR GRADING", theme);
+    spawn_slider_row(
+        commands,
+        tab,
+        "Exposure",
+        SettingsSlider::Exposure,
+        SettingsValue::Exposure,
+        settings,
+        theme,
+    );
+    spawn_slider_row(
+        commands,
+        tab,
+        "Saturation",
+        SettingsSlider::Saturation,
+        SettingsValue::Saturation,
+        settings,
+        theme,
+    );
+    spawn_slider_row(
+        commands,
+        tab,
+        "Contrast",
+        SettingsSlider::Contrast,
+        SettingsValue::Contrast,
+        settings,
+        theme,
+    );
+    spawn_slider_row(
+        commands,
+        tab,
+        "Temperature",
+        SettingsSlider::Temperature,
+        SettingsValue::Temperature,
+        settings,
+        theme,
+    );
+}
+
+fn setup_audio_tab(commands: &mut Commands, tab: Entity, theme: &UiTheme) {
+    spawn_section_heading(commands, tab, "AUDIO", theme);
+    spawn_note(
+        commands,
+        tab,
+        "Audio settings are not available in this build yet.",
+        theme.fonts.body,
         theme.colors.muted_text,
         theme,
     );
 }
 
 fn setup_mouse_tab(commands: &mut Commands, tab: Entity, settings: &GameSettings, theme: &UiTheme) {
-    spawn_text(
-        commands,
-        theme,
-        tab,
-        "MOUSE",
-        theme.fonts.compass,
-        theme.colors.accent,
-        StaticLabel,
-    );
+    spawn_section_heading(commands, tab, "LOOK", theme);
     spawn_slider_row(
         commands,
         tab,
@@ -632,92 +914,81 @@ fn setup_mouse_tab(commands: &mut Commands, tab: Entity, settings: &GameSettings
         commands,
         tab,
         "Lower values turn slowly; higher values turn quickly.",
-        theme.fonts.slot_count,
+        theme.fonts.small,
         theme.colors.muted_text,
         theme,
     );
 }
 
-fn setup_controls_tab(
+fn setup_keybinds_tab(
     commands: &mut Commands,
     tab: Entity,
     bindings: &InputBindings,
     theme: &UiTheme,
 ) {
-    spawn_text(
-        commands,
-        theme,
-        tab,
-        "CONTROLS",
-        theme.fonts.compass,
-        theme.colors.accent,
-        StaticLabel,
-    );
-    for (key, action) in [
-        (bindings.move_forward, "Move forward"),
-        (bindings.move_back, "Move back"),
-        (bindings.move_left, "Move left"),
-        (bindings.move_right, "Move right"),
-        (bindings.jump, "Jump"),
-        (bindings.sprint, "Sprint"),
-        (bindings.crouch, "Crouch"),
-        (bindings.chat, "Chat"),
-        (bindings.pause, "Pause"),
-        (bindings.help, "Help"),
-        (bindings.backpack, "Backpack and character"),
-        (bindings.debug_overlay, "Debug overlay"),
-        (bindings.save, "Save"),
-        (bindings.load, "Load"),
-        (bindings.screenshot, "Screenshot"),
-    ] {
-        spawn_binding_row(commands, tab, key_label(key), action, theme);
-    }
     spawn_note(
         commands,
         tab,
-        "LMB mines or places. RMB gathers, opens the hammer menu and picks up.",
+        "Click a key to rebind it. Esc cancels without changing the binding. Taking an assigned key swaps the two actions. Rebindings last for this session.",
         theme.fonts.small,
         theme.colors.muted_text,
         theme,
     );
-    spawn_note(
-        commands,
-        tab,
-        "1-8 select hotbar slots; the wheel cycles them.",
-        theme.fonts.small,
-        theme.colors.muted_text,
-        theme,
-    );
-}
 
-fn setup_map_tab(commands: &mut Commands, tab: Entity, bindings: &InputBindings, theme: &UiTheme) {
-    spawn_text(
-        commands,
-        theme,
-        tab,
-        "MAP / DEBUG",
-        theme.fonts.compass,
-        theme.colors.accent,
-        StaticLabel,
-    );
+    let grid = commands
+        .spawn((
+            Node {
+                width: Val::Percent(100.0),
+                flex_direction: FlexDirection::Row,
+                flex_wrap: FlexWrap::Wrap,
+                column_gap: Val::Px(10.0),
+                row_gap: Val::Px(6.0),
+                ..default()
+            },
+            ChildOf(tab),
+        ))
+        .id();
+
+    spawn_section_heading(commands, grid, "MOVEMENT", theme);
+    for action in [
+        BindingAction::MoveForward,
+        BindingAction::MoveBack,
+        BindingAction::MoveLeft,
+        BindingAction::MoveRight,
+        BindingAction::Jump,
+        BindingAction::Sprint,
+        BindingAction::Crouch,
+    ] {
+        spawn_keybind_row(commands, grid, action, bindings, theme);
+    }
+
+    spawn_section_heading(commands, grid, "INTERFACE", theme);
+    for action in [
+        BindingAction::Chat,
+        BindingAction::Pause,
+        BindingAction::Help,
+        BindingAction::DebugOverlay,
+        BindingAction::Backpack,
+        BindingAction::Map,
+        BindingAction::ToggleHud,
+    ] {
+        spawn_keybind_row(commands, grid, action, bindings, theme);
+    }
+
+    spawn_section_heading(commands, grid, "WORLD", theme);
+    for action in [
+        BindingAction::RotatePlace,
+        BindingAction::Save,
+        BindingAction::Load,
+        BindingAction::Screenshot,
+    ] {
+        spawn_keybind_row(commands, grid, action, bindings, theme);
+    }
+
     spawn_note(
         commands,
         tab,
-        format!(
-            "{} opens the overhead map. Drag to pan, scroll to zoom, C/Home to recenter.",
-            key_label(bindings.map)
-        ),
-        theme.fonts.slot_count,
-        theme.colors.muted_text,
-        theme,
-    );
-    spawn_note(
-        commands,
-        tab,
-        format!(
-            "{} shows the debug overlay.",
-            key_label(bindings.debug_overlay)
-        ),
+        "RMB places and interacts. Mouse buttons and hotbar slots are not rebindable yet.",
         theme.fonts.slot_count,
         theme.colors.muted_text,
         theme,
@@ -732,7 +1003,7 @@ fn spawn_menu_button(
     height: f32,
     action: SettingsAction,
     theme: &UiTheme,
-) {
+) -> Entity {
     let button = commands
         .spawn((
             Button,
@@ -763,18 +1034,28 @@ fn spawn_menu_button(
         theme.colors.text,
         StaticLabel,
     );
+    button
 }
 
-fn spawn_divider(commands: &mut Commands, parent: Entity, theme: &UiTheme) {
-    commands.spawn((
+fn spawn_section_heading(commands: &mut Commands, parent: Entity, label: &str, theme: &UiTheme) {
+    let heading = spawn_text(
+        commands,
+        theme,
+        parent,
+        label,
+        theme.fonts.compass,
+        theme.colors.accent,
+        StaticLabel,
+    );
+    commands.entity(heading).insert((
+        TextLayout::justify(Justify::Left),
         Node {
             width: Val::Percent(100.0),
-            height: Val::Px(1.0),
+            max_width: Val::Px(SETTINGS_ROW_WIDTH),
             flex_shrink: 0.0,
+            margin: UiRect::top(Val::Px(6.0)),
             ..default()
         },
-        BackgroundColor(theme.colors.faint_border),
-        ChildOf(parent),
     ));
 }
 
@@ -791,6 +1072,7 @@ fn spawn_slider_row(
         .spawn((
             Node {
                 width: Val::Percent(100.0),
+                max_width: Val::Px(SETTINGS_ROW_WIDTH),
                 min_height: Val::Px(32.0),
                 align_items: AlignItems::Center,
                 justify_content: JustifyContent::SpaceBetween,
@@ -887,6 +1169,7 @@ fn spawn_toggle_row(
         .spawn((
             Node {
                 width: Val::Percent(100.0),
+                max_width: Val::Px(SETTINGS_ROW_WIDTH),
                 min_height: Val::Px(32.0),
                 align_items: AlignItems::Center,
                 justify_content: JustifyContent::SpaceBetween,
@@ -937,36 +1220,63 @@ fn spawn_toggle_row(
     );
 }
 
-fn spawn_binding_row(
+fn spawn_keybind_row(
     commands: &mut Commands,
     parent: Entity,
-    key: String,
-    action: &str,
+    action: BindingAction,
+    bindings: &InputBindings,
     theme: &UiTheme,
 ) {
-    let row = commands
+    let card = commands
         .spawn((
+            Button,
+            MenuButton,
+            BindingButton(action),
+            SettingsAction::Rebind(action),
             Node {
-                width: Val::Percent(100.0),
-                min_height: Val::Px(22.0),
+                width: Val::Px(KEYBIND_CARD_WIDTH),
+                height: Val::Px(34.0),
+                flex_shrink: 0.0,
+                padding: UiRect::axes(Val::Px(10.0), Val::Px(0.0)),
                 align_items: AlignItems::Center,
-                column_gap: Val::Px(10.0),
+                justify_content: JustifyContent::SpaceBetween,
+                column_gap: Val::Px(8.0),
+                border: theme.shape.border(),
+                border_radius: theme.shape.rounded_small(),
                 ..default()
             },
+            BackgroundColor(theme.colors.button_bg),
+            BorderColor::all(theme.colors.border_idle),
+            Hovered::default(),
             ChildOf(parent),
         ))
         .id();
-    let key = spawn_keycap(commands, theme, row, key, 64.0);
-    commands.entity(key).insert(StaticLabel);
+
     spawn_text(
         commands,
         theme,
-        row,
-        action,
+        card,
+        action.label(),
         theme.fonts.body,
         theme.colors.text,
         StaticLabel,
     );
+    let key = spawn_text(
+        commands,
+        theme,
+        card,
+        key_label(action.get(bindings)),
+        theme.fonts.keycap,
+        theme.colors.accent_soft,
+        BindingValue(action),
+    );
+    commands.entity(key).insert((
+        TextLayout::justify(Justify::Right),
+        Node {
+            width: Val::Px(88.0),
+            ..default()
+        },
+    ));
 }
 
 /// Static text that may need to wrap inside a narrow tab.
@@ -983,6 +1293,8 @@ fn spawn_note(
         TextLayout::justify(Justify::Left),
         Node {
             width: Val::Percent(100.0),
+            max_width: Val::Px(SETTINGS_ROW_WIDTH),
+            flex_shrink: 0.0,
             ..default()
         },
     ));
@@ -1014,6 +1326,117 @@ fn sync_tab_panels(tab: Res<SettingsTab>, mut panels: Query<(&TabPanel, &mut Nod
         if node.display != desired {
             node.display = desired;
         }
+    }
+}
+
+fn capture_keybind(
+    keys: Res<ButtonInput<KeyCode>>,
+    ui: Res<UiManager>,
+    mut capture: ResMut<KeybindCapture>,
+    mut bindings: ResMut<InputBindings>,
+) {
+    if !ui.is_open(Overlay::Settings) {
+        if capture.0.is_some() {
+            capture.0 = None;
+        }
+        return;
+    }
+
+    let Some(action) = capture.0 else {
+        return;
+    };
+
+    if keys.just_pressed(KeyCode::Escape) {
+        capture.0 = None;
+        return;
+    }
+
+    if let Some(key) = keys.get_just_pressed().next().copied() {
+        action.set(&mut bindings, key);
+        capture.0 = None;
+    }
+}
+
+fn update_binding_values(
+    bindings: Res<InputBindings>,
+    capture: Res<KeybindCapture>,
+    theme: Res<UiTheme>,
+    mut labels: Query<(&BindingValue, &mut Text, &mut TextColor)>,
+) {
+    if !bindings.is_changed() && !capture.is_changed() {
+        return;
+    }
+
+    for (binding, mut text, mut color) in &mut labels {
+        let waiting = capture.0 == Some(binding.0);
+        let desired = if waiting {
+            "PRESS KEY".to_string()
+        } else {
+            key_label(binding.0.get(&bindings))
+        };
+        if text.0 != desired {
+            text.0 = desired;
+        }
+        let desired_color = if waiting {
+            theme.colors.accent_soft
+        } else {
+            theme.colors.text
+        };
+        if color.0 != desired_color {
+            color.0 = desired_color;
+        }
+    }
+}
+
+fn style_tab_buttons(
+    tab: Res<SettingsTab>,
+    theme: Res<UiTheme>,
+    mut buttons: TabButtonQuery<'_, '_>,
+) {
+    for (button, hovered, pressed, mut background, mut border) in &mut buttons {
+        let active = button.0 == *tab;
+        let desired_background = if active {
+            theme.colors.selected_bg
+        } else if pressed {
+            theme.colors.button_pressed
+        } else if hovered.0 {
+            theme.colors.button_hover
+        } else {
+            theme.colors.button_bg
+        };
+        if background.0 != desired_background {
+            background.0 = desired_background;
+        }
+
+        let desired_border = if active {
+            theme.colors.border_active
+        } else if hovered.0 {
+            theme.colors.border_hover
+        } else {
+            theme.colors.border_idle
+        };
+        if border.top != desired_border {
+            *border = BorderColor::all(desired_border);
+        }
+    }
+}
+
+fn style_binding_buttons(
+    capture: Res<KeybindCapture>,
+    theme: Res<UiTheme>,
+    mut buttons: BindingButtonQuery<'_, '_>,
+) {
+    for (button, hovered, pressed, mut background, mut border) in &mut buttons {
+        if capture.0 != Some(button.0) {
+            continue;
+        }
+        if background.0 != theme.colors.button_pressed {
+            background.0 = theme.colors.button_pressed;
+        }
+        if border.top != theme.colors.border_active {
+            *border = BorderColor::all(theme.colors.border_active);
+        }
+        let _ = (hovered, pressed);
     }
 }
 
@@ -1068,6 +1491,20 @@ fn update_values(settings: Res<GameSettings>, mut labels: Query<(&SettingsValue,
             SettingsValue::Vsync => on_off(settings.vsync),
             SettingsValue::Fullscreen => on_off(settings.fullscreen),
             SettingsValue::PerfLog => on_off(settings.perf_log),
+            SettingsValue::Clouds => on_off(settings.clouds_enabled),
+            SettingsValue::LightShaftsMode => match settings.light_shafts_mode {
+                crate::light_shafts::LightShaftsMode::Off => "Off".to_string(),
+                crate::light_shafts::LightShaftsMode::Simple => "Simple".to_string(),
+                crate::light_shafts::LightShaftsMode::Detailed => "Detailed".to_string(),
+            },
+            SettingsValue::Tonemapping => settings.tonemapping.label().to_string(),
+            SettingsValue::Exposure => format!("{:+.2} EV", settings.exposure_ev),
+            SettingsValue::Saturation => format!("{:.2}", settings.saturation),
+            SettingsValue::Contrast => format!("{:.2}", settings.contrast),
+            SettingsValue::Temperature => format!("{:+.2}", settings.temperature),
+            SettingsValue::WindStrength => format!("{:.3}", settings.wind_strength),
+            SettingsValue::Ssao => settings.ssao.label().to_string(),
+            SettingsValue::Bloom => settings.bloom.label().to_string(),
         };
         if text.0 != desired {
             text.0 = desired;
@@ -1178,18 +1615,37 @@ fn on_slider_change(
             settings.render_distance =
                 (change.value.round() as i32).clamp(MIN_RENDER_DISTANCE, MAX_RENDER_DISTANCE);
         }
+        SettingsSlider::Exposure => settings.exposure_ev = change.value.clamp(-2.0, 2.0),
+        SettingsSlider::Saturation => settings.saturation = change.value.clamp(0.5, 1.5),
+        SettingsSlider::Contrast => settings.contrast = change.value.clamp(0.8, 1.3),
+        SettingsSlider::Temperature => settings.temperature = change.value.clamp(-0.5, 0.5),
+        SettingsSlider::WindStrength => settings.wind_strength = change.value.clamp(0.0, 0.2),
     }
 }
 
-fn on_activate(
-    activate: On<Activate>,
-    actions: Query<&SettingsAction>,
-    mut settings: ResMut<GameSettings>,
-    mut tab: ResMut<SettingsTab>,
-    mut menu: ResMut<MenuState>,
-    mut ui: ResMut<UiManager>,
-    mut commands: Commands,
-) {
+#[derive(SystemParam)]
+struct SettingsActionState<'w, 's> {
+    actions: Query<'w, 's, &'static SettingsAction>,
+    settings: ResMut<'w, GameSettings>,
+    bindings: ResMut<'w, InputBindings>,
+    capture: ResMut<'w, KeybindCapture>,
+    tab: ResMut<'w, SettingsTab>,
+    menu: ResMut<'w, MenuState>,
+    ui: ResMut<'w, UiManager>,
+    commands: Commands<'w, 's>,
+}
+
+fn on_activate(activate: On<Activate>, state: SettingsActionState<'_, '_>) {
+    let SettingsActionState {
+        actions,
+        mut settings,
+        mut bindings,
+        mut capture,
+        mut tab,
+        mut menu,
+        mut ui,
+        mut commands,
+    } = state;
     let Ok(action) = actions.get(activate.entity) else {
         return;
     };
@@ -1204,11 +1660,31 @@ fn on_activate(
         SettingsAction::TogglePerfLog => {
             settings.perf_log = !settings.perf_log;
         }
+        SettingsAction::ToggleClouds => {
+            settings.clouds_enabled = !settings.clouds_enabled;
+        }
+        SettingsAction::CycleLightShafts => {
+            settings.light_shafts_mode = settings.light_shafts_mode.next();
+        }
+        SettingsAction::CycleTonemapping => {
+            settings.tonemapping = settings.tonemapping.next();
+        }
+        SettingsAction::CycleSsao => {
+            settings.ssao = settings.ssao.next();
+        }
+        SettingsAction::CycleBloom => {
+            settings.bloom = settings.bloom.next();
+        }
         SettingsAction::CycleShadows => {
             settings.shadow_quality = settings.shadow_quality.next();
         }
+        SettingsAction::Rebind(action) => {
+            capture.0 = Some(action);
+        }
         SettingsAction::ResetDefaults => {
             *settings = GameSettings::default();
+            *bindings = InputBindings::default();
+            capture.0 = None;
         }
         SettingsAction::Resume => {
             menu.resume_requested = true;
@@ -1234,8 +1710,12 @@ mod tests {
 
     #[test]
     fn tab_labels_are_short() {
-        assert_eq!(SettingsTab::Video.label(), "Video");
-        assert_eq!(SettingsTab::Controls.label(), "Controls");
+        assert_eq!(SettingsTab::Graphics.label(), "Graphics");
+        assert_eq!(SettingsTab::Lighting.label(), "Lighting");
+        assert_eq!(SettingsTab::Color.label(), "Color");
+        assert_eq!(SettingsTab::Keybinds.label(), "Keybinds");
+        assert_eq!(SettingsTab::Audio.label(), "Audio");
+        assert_eq!(SettingsTab::ALL.len(), 6);
     }
 
     #[test]
@@ -1249,8 +1729,10 @@ mod tests {
         const {
             assert!(SETTINGS_PADDING_X > 0.0);
             assert!(SETTINGS_PADDING_Y > 0.0);
-            assert!(SETTINGS_CONTENT_WIDTH > 0.0);
-            assert!(SETTINGS_CONTENT_WIDTH < 1280.0);
+            assert!(SETTINGS_SIDEBAR_WIDTH > SETTINGS_TAB_WIDTH);
+            assert!(SETTINGS_ROW_WIDTH > SLIDER_WIDTH);
+            assert!(SETTINGS_CONTENT_WIDTH > SETTINGS_ROW_WIDTH);
+            assert!(KEYBIND_CARD_WIDTH > 200.0);
         }
     }
 }

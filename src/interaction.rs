@@ -8,10 +8,12 @@
 //! voxel is highlighted as one 1 m cube, mined as its eight detail cells, and
 //! rewards one resource item. Detail objects keep 0.5 m shape-aware previews.
 //!
-//! The selected hotbar stack drives left click. Block materials place one cube
-//! against the hit face and consume one item. The hammer applies the shape
-//! chosen in the hold-RMB menu to the targeted block. The wrench rotates the
-//! targeted block. Mining tools keep the original hold-to-mine behaviour.
+//! The selected hotbar stack drives right click. Block materials and placeable
+//! structures use RMB against the hit face and consume one item, matching
+//! Minecraft. RMB also interacts with structures, gathers loose clutter and
+//! picks up drops. The hammer applies the shape chosen in the hold-RMB menu to
+//! the targeted block. The wrench rotates the targeted block with left click.
+//! Mining tools keep the original hold-to-mine behaviour.
 
 use std::collections::HashMap;
 
@@ -20,6 +22,7 @@ use bevy::ecs::system::SystemParam;
 use bevy::light::NotShadowCaster;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
+use bevy::world_serialization::{WorldAsset, WorldAssetRoot};
 
 use crate::backpack::Backpack;
 use crate::construction::{
@@ -817,6 +820,7 @@ fn handle_mining(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut visuals: ResMut<InteractionVisuals>,
+    asset_server: Res<AssetServer>,
     mut mining: ResMut<MiningState>,
     felling: Res<FellingConfig>,
 ) {
@@ -1186,6 +1190,7 @@ fn handle_mining(
             complete_mining(
                 &mut commands,
                 &visuals,
+                &asset_server,
                 &mut manager,
                 &mut structures,
                 &mut structure_entities,
@@ -1197,6 +1202,7 @@ fn handle_mining(
                     &mut manager,
                     &mut meshes,
                     &visuals,
+                    &asset_server,
                     plan,
                     &felling,
                 );
@@ -1300,6 +1306,7 @@ fn cancel_mining(
 fn complete_mining(
     commands: &mut Commands,
     visuals: &InteractionVisuals,
+    asset_server: &AssetServer,
     manager: &mut ChunkManager,
     structures: &mut Structures,
     structure_entities: &mut StructureEntities,
@@ -1323,7 +1330,7 @@ fn complete_mining(
                 |a, b| (a.0.min(b.0), a.1.max(b.1)),
             );
             let origin = (min + max) * 0.5;
-            spawn_drop(commands, visuals, refund, 1, origin);
+            spawn_drop(commands, visuals, asset_server, refund, 1, origin);
         }
         // visual already hidden at start; ensure gone
         despawn_structure_visual(commands, structure_entities, sid);
@@ -1362,6 +1369,7 @@ fn complete_mining(
         spawn_reward(
             commands,
             visuals,
+            asset_server,
             natural_surface_harvest_reward(layer),
             centre,
         );
@@ -1389,7 +1397,7 @@ fn complete_mining(
         };
         manager.set_voxel(cell, voxel.with_shape(debarked_shape));
         let centre = target.as_vec3() + Vec3::splat(0.5);
-        spawn_drop(commands, visuals, ItemId::Bark, 1, centre);
+        spawn_drop(commands, visuals, asset_server, ItemId::Bark, 1, centre);
         mining.surface_originals.clear();
         mining.world_original = None;
         mining.elapsed = 0.0;
@@ -1420,13 +1428,13 @@ fn complete_mining(
     };
     let centre = average_centre(&originals);
 
-    spawn_reward(commands, visuals, reward, centre);
+    spawn_reward(commands, visuals, asset_server, reward, centre);
     if !mining.is_world
         && let Some((cell, voxel)) = originals.first()
         && voxel.block() == Block::Leaves
         && let Some(item) = crate::felling::leaf_drop_item(*cell)
     {
-        spawn_drop(commands, visuals, item, 1, centre);
+        spawn_drop(commands, visuals, asset_server, item, 1, centre);
     }
 
     // The 1 m layer was already cleared when the swing started, so finishing
@@ -1452,13 +1460,21 @@ fn average_centre(originals: &[(IVec3, Voxel)]) -> Vec3 {
 fn spawn_reward(
     commands: &mut Commands,
     visuals: &InteractionVisuals,
+    asset_server: &AssetServer,
     reward: MiningReward,
     centre: Vec3,
 ) {
     if let Some(item) = reward.item
         && reward.item_count > 0
     {
-        spawn_drop(commands, visuals, item, reward.item_count, centre);
+        spawn_drop(
+            commands,
+            visuals,
+            asset_server,
+            item,
+            reward.item_count,
+            centre,
+        );
     }
 }
 
@@ -1517,30 +1533,25 @@ fn preview_material(
 fn spawn_drop(
     commands: &mut Commands,
     visuals: &InteractionVisuals,
+    asset_server: &AssetServer,
     item: ItemId,
     count: u32,
     position: Vec3,
 ) {
-    spawn_drop_with_cooldown(commands, visuals, item, count, position, 0.0);
+    spawn_drop_with_cooldown(commands, visuals, asset_server, item, count, position, 0.0);
 }
 
 fn spawn_drop_with_cooldown(
     commands: &mut Commands,
     visuals: &InteractionVisuals,
+    asset_server: &AssetServer,
     item: ItemId,
     count: u32,
     position: Vec3,
     pickup_cooldown: f32,
 ) {
-    let material = visuals
-        .drop_materials
-        .get(&item)
-        .cloned()
-        .unwrap_or_else(|| visuals.fallback_drop_material.clone());
-    let mesh = visuals.drop_meshes.get(&item).cloned().unwrap_or_default();
     let half_height = drop_mesh_size(item).y * 0.5;
-
-    commands.spawn((
+    let mut entity = commands.spawn((
         BlockDrop {
             item,
             count,
@@ -1554,11 +1565,23 @@ fn spawn_drop_with_cooldown(
             support_timer: DROP_SUPPORT_INTERVAL,
             pickup_cooldown: pickup_cooldown.max(0.0),
         },
-        Mesh3d(mesh),
-        MeshMaterial3d(material),
         Transform::from_translation(position),
+        Visibility::Inherited,
         Name::new(format!("Drop ({})", item.display_name())),
     ));
+
+    if let Some(model) = crate::held_item::drop_model(item) {
+        let scene: Handle<WorldAsset> = asset_server.load(model);
+        entity.insert(WorldAssetRoot(scene));
+    } else {
+        let material = visuals
+            .drop_materials
+            .get(&item)
+            .cloned()
+            .unwrap_or_else(|| visuals.fallback_drop_material.clone());
+        let mesh = visuals.drop_meshes.get(&item).cloned().unwrap_or_default();
+        entity.insert((Mesh3d(mesh), MeshMaterial3d(material)));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1654,6 +1677,7 @@ fn fell_tree(
     manager: &mut ChunkManager,
     meshes: &mut Assets<Mesh>,
     visuals: &InteractionVisuals,
+    asset_server: &AssetServer,
     plan: FellPlan,
     config: &FellingConfig,
 ) {
@@ -1676,7 +1700,14 @@ fn fell_tree(
     let centre = average_centre(&removed);
     for (index, (item, count)) in wood_drop_counts(&removed).into_iter().enumerate() {
         let offset = Vec3::X * (index as f32 * 0.35);
-        spawn_drop(commands, visuals, item, count, centre + offset);
+        spawn_drop(
+            commands,
+            visuals,
+            asset_server,
+            item,
+            count,
+            centre + offset,
+        );
     }
 
     let leaf_plan = FellPlan { cells: removed };
@@ -1723,6 +1754,7 @@ fn update_tree_debris(
     time: Res<Time>,
     manager: Res<ChunkManager>,
     visuals: Res<InteractionVisuals>,
+    asset_server: Res<AssetServer>,
     config: Res<FellingConfig>,
     mut debris: Query<(Entity, &mut TreeDebris, &mut Transform)>,
 ) {
@@ -1740,7 +1772,14 @@ fn update_tree_debris(
 
         if step.despawn {
             if let Some(item) = step.drop_item {
-                spawn_drop(&mut commands, &visuals, item, 1, step.state.position);
+                spawn_drop(
+                    &mut commands,
+                    &visuals,
+                    &asset_server,
+                    item,
+                    1,
+                    step.state.position,
+                );
             }
             commands.entity(entity).despawn();
             continue;
@@ -1864,11 +1903,12 @@ where
 pub fn spawn_player_drop(
     commands: &mut Commands,
     visuals: &InteractionVisuals,
+    asset_server: &AssetServer,
     item: ItemId,
     count: u32,
     position: Vec3,
 ) {
-    spawn_drop_with_cooldown(commands, visuals, item, count, position, 1.25);
+    spawn_drop_with_cooldown(commands, visuals, asset_server, item, count, position, 1.25);
 }
 
 fn find_targeted_drop(
@@ -1910,14 +1950,11 @@ struct StructureSpawn<'w, 's> {
 
 #[allow(clippy::too_many_arguments)]
 fn handle_placement_actions(
-    keys: Res<ButtonInput<KeyCode>>,
     mouse: Res<ButtonInput<MouseButton>>,
-    bindings: Res<crate::settings::InputBindings>,
     capture: Res<CursorCapture>,
     mut pockets: ResMut<Pockets>,
     mut backpack: ResMut<Backpack>,
     crosshair: Res<CrosshairTarget>,
-    structure_hit: Res<StructureCrosshair>,
     camera: Query<&GlobalTransform, With<PlayerCamera>>,
     player_query: Query<(&Transform, &Player), Without<PlayerCamera>>,
     mut manager: ResMut<ChunkManager>,
@@ -1925,8 +1962,7 @@ fn handle_placement_actions(
     mut spawn: StructureSpawn,
     place_rotation: Res<StructurePlaceRotation>,
 ) {
-    let place_pressed = keys.just_pressed(bindings.place) || mouse.just_pressed(MouseButton::Right);
-    if !capture.grabbed || capture.just_grabbed || !place_pressed {
+    if !capture.grabbed || capture.just_grabbed || !mouse.just_pressed(MouseButton::Right) {
         return;
     }
     let Some(stack) = pockets.selected_stack() else {
@@ -1934,19 +1970,6 @@ fn handle_placement_actions(
     };
     if tool_for_item(stack.item).is_some() {
         return;
-    }
-    // If RMB was used and a structure is targeted, only place when holding a
-    // placeable item/structure; otherwise let structure interaction handle RMB.
-    if mouse.just_pressed(MouseButton::Right) && !keys.just_pressed(bindings.place) {
-        let voxel_dist = crosshair.hit.map(|h| h.distance);
-        let structure_targeted = structure_hit
-            .hit
-            .is_some_and(|(sd, _, _)| voxel_dist.is_none_or(|vd| sd <= vd));
-        let is_placeable = stack.item.def().place_block.is_some()
-            || matches!(stack.item, ItemId::Workbench | ItemId::Furnace);
-        if structure_targeted && !is_placeable {
-            return;
-        }
     }
     let Ok((player_transform, player)) = player_query.single() else {
         return;
@@ -2055,6 +2078,7 @@ struct PickupActionsParams<'w, 's> {
     manager: ResMut<'w, ChunkManager>,
     meshes: ResMut<'w, Assets<Mesh>>,
     visuals: Res<'w, InteractionVisuals>,
+    asset_server: Res<'w, AssetServer>,
     pickup_timer: ResMut<'w, PickupTimer>,
     drops: Query<'w, 's, (Entity, &'static Transform, &'static mut BlockDrop)>,
     pockets: ResMut<'w, Pockets>,
@@ -2090,6 +2114,7 @@ fn handle_pickup_actions(mut p: PickupActionsParams) {
             &mut p.manager,
             &mut p.meshes,
             &p.visuals,
+            &p.asset_server,
             &mut p.pockets,
             &mut p.backpack,
             &mut p.progression,
@@ -2118,8 +2143,6 @@ fn handle_pickup_actions(mut p: PickupActionsParams) {
 #[allow(clippy::too_many_arguments)]
 fn handle_structure_interact(
     mouse: Res<ButtonInput<MouseButton>>,
-    keys: Res<ButtonInput<KeyCode>>,
-    bindings: Res<crate::settings::InputBindings>,
     capture: Res<CursorCapture>,
     pockets: Res<Pockets>,
     crosshair: Res<CrosshairTarget>,
@@ -2141,7 +2164,7 @@ fn handle_structure_interact(
             && (s.item.def().place_block.is_some()
                 || matches!(s.item, ItemId::Workbench | ItemId::Furnace))
     });
-    if holding_placeable && !keys.just_pressed(bindings.place) {
+    if holding_placeable {
         return;
     }
     let voxel_dist = crosshair.hit.map(|h| h.distance);
@@ -2573,6 +2596,7 @@ fn try_natural_pickup(
     manager: &mut ChunkManager,
     meshes: &mut Assets<Mesh>,
     visuals: &InteractionVisuals,
+    asset_server: &AssetServer,
     pockets: &mut Pockets,
     backpack: &mut Backpack,
     progression: &mut Progression,
@@ -2635,7 +2659,7 @@ fn try_natural_pickup(
     let leftover = store_item(pockets, backpack, item, reward.item_count);
     let collected = reward.item_count - leftover;
     if leftover > 0 {
-        spawn_drop(commands, visuals, item, leftover, centre);
+        spawn_drop(commands, visuals, asset_server, item, leftover, centre);
     }
     progression.award_pickup(item, collected);
     feed.push_item(item, collected);
@@ -2732,7 +2756,6 @@ mod tests {
                 triangles: 0,
                 water_triangles: 0,
                 foliage_triangles: 0,
-                fade_remaining: 0.0,
             },
         );
         for cell in world_voxel_cells(world) {
@@ -2749,7 +2772,6 @@ mod tests {
                     triangles: 0,
                     water_triangles: 0,
                     foliage_triangles: 0,
-                    fade_remaining: 0.0,
                 })
                 .data
                 .set_local(cx, cy, cz, block);

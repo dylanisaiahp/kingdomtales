@@ -27,8 +27,8 @@ use crate::crafting::{CraftingUiState, recipes_for_ui, validate_recipe};
 
 use self::icons::UiIcons;
 use self::theme::{
-    UiTheme, display_if, format_number, key_label, spawn_bar_overlay, spawn_item_icon,
-    spawn_keycap, spawn_panel, spawn_text,
+    UiTheme, display_if, format_number, key_label, spawn_bar_overlay, spawn_hud_icon,
+    spawn_item_icon, spawn_keycap, spawn_panel, spawn_text,
 };
 use crate::backpack::{ATTACHMENT_SLOTS, Backpack, CATEGORY_SLOTS_PER_UNLOCK, MAX_CAPACITY};
 use crate::insight::InsightInfo;
@@ -38,7 +38,7 @@ use crate::notifications::{NotificationFeed, NotificationTone};
 use crate::player::{CrosshairTarget, CursorCapture, Player, Stamina};
 use crate::pockets::{POCKET_COUNT, Pockets};
 use crate::progression::{Attribute, Progression};
-use crate::settings::{GameSettings, InputBindings};
+use crate::settings::{GameSettings, InputBindings, LightingSystems, UndergroundLighting};
 use crate::ui_manager::{Overlay, UiManager};
 use crate::world::chunk::BLOCK_SIZE;
 use crate::world::{BiomeInfo, ChunkManager, InitialWorldLoad, WorldTimings};
@@ -225,6 +225,10 @@ impl Plugin for UiPlugin {
                     .chain()
                     .in_set(HudUpdateSystems),
             )
+            .add_systems(
+                Update,
+                update_underwater_tint.after(LightingSystems::UpdateUnderground),
+            )
             .add_observer(on_backpack_activate)
             .add_observer(on_slot_drag_start)
             .add_observer(on_slot_drag_drop)
@@ -240,6 +244,21 @@ pub struct FpsCounter {
     pub frame_ms: f32,
     frames: u32,
     elapsed: f32,
+    recent: Vec<f32>,
+}
+
+impl FpsCounter {
+    pub fn frame_stats(&self) -> (f32, f32, f32) {
+        if self.recent.is_empty() {
+            return (0.0, 0.0, 0.0);
+        }
+        let mut sorted = self.recent.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let max = *sorted.last().unwrap_or(&0.0);
+        let p95 = sorted[((sorted.len() - 1) as f32 * 0.95) as usize];
+        let p99 = sorted[((sorted.len() - 1) as f32 * 0.99) as usize];
+        (max, p95, p99)
+    }
 }
 
 impl Default for FpsCounter {
@@ -249,6 +268,7 @@ impl Default for FpsCounter {
             frame_ms: 0.0,
             frames: 0,
             elapsed: 0.0,
+            recent: Vec::with_capacity(240),
         }
     }
 }
@@ -315,6 +335,9 @@ struct InitialLoadingText;
 struct InitialLoadingFill;
 
 #[derive(Component)]
+struct UnderwaterTint;
+
+#[derive(Component)]
 struct CrosshairRoot;
 
 /// Always-present flex slot that keeps the hunger and thirst bars in place
@@ -368,7 +391,14 @@ struct ThirstFill;
 struct WorldInfoBiomeText;
 
 #[derive(Component)]
-struct WorldInfoTimeText;
+struct WorldInfoDayText;
+
+#[derive(Component)]
+struct WorldInfoClockText;
+
+/// Day/night indicator beside the day counter in the character HUD.
+#[derive(Component)]
+struct WeatherIcon;
 
 #[derive(Component)]
 struct InsightIcon;
@@ -615,6 +645,18 @@ fn update_initial_loading_screen(
     }
 }
 
+fn update_underwater_tint(
+    lighting: Res<UndergroundLighting>,
+    mut tint: Query<&mut BackgroundColor, With<UnderwaterTint>>,
+) {
+    let color = Color::srgba(0.07, 0.24, 0.40, lighting.water_blend() * 0.42);
+    for mut background in &mut tint {
+        if background.0 != color {
+            background.0 = color;
+        }
+    }
+}
+
 fn setup_hud(
     mut commands: Commands,
     bindings: Res<InputBindings>,
@@ -633,6 +675,22 @@ fn setup_hud(
             },
         ))
         .id();
+
+    commands.spawn((
+        UnderwaterTint,
+        Name::new("UnderwaterTint"),
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(0.0),
+            top: Val::Px(0.0),
+            width: Val::Percent(100.0),
+            height: Val::Percent(100.0),
+            ..default()
+        },
+        BackgroundColor(Color::srgba(0.07, 0.24, 0.40, 0.0)),
+        GlobalZIndex(-1),
+        Pickable::IGNORE,
+    ));
 
     let dock = commands
         .spawn((
@@ -754,7 +812,7 @@ fn setup_bottom_panels(
 
 /// Always-visible character HUD: portrait placeholder, level, XP progress bar,
 /// and current XP / XP required. Compass remains separate and unchanged.
-fn setup_character_hud(commands: &mut Commands, hud: Entity, theme: &UiTheme, _icons: &UiIcons) {
+fn setup_character_hud(commands: &mut Commands, hud: Entity, theme: &UiTheme, icons: &UiIcons) {
     let panel = spawn_panel(
         commands,
         theme,
@@ -829,14 +887,36 @@ fn setup_character_hud(commands: &mut Commands, hud: Entity, theme: &UiTheme, _i
             ChildOf(header),
         ))
         .id();
+    let time_row = commands
+        .spawn((
+            Node {
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::FlexEnd,
+                column_gap: Val::Px(5.0),
+                flex_shrink: 0.0,
+                ..default()
+            },
+            Pickable::IGNORE,
+            ChildOf(time_block),
+        ))
+        .id();
+    spawn_hud_icon(
+        commands,
+        icons,
+        time_row,
+        crate::ui::icons::HudIcon::WeatherDay,
+        20.0,
+        WeatherIcon,
+    );
     spawn_text(
         commands,
         theme,
-        time_block,
+        time_row,
         "Day 1",
         theme.fonts.small,
         theme.colors.text,
-        WorldInfoTimeText,
+        WorldInfoDayText,
     );
     spawn_text(
         commands,
@@ -845,7 +925,7 @@ fn setup_character_hud(commands: &mut Commands, hud: Entity, theme: &UiTheme, _i
         "07:00 AM",
         theme.fonts.micro,
         theme.colors.muted_text,
-        HudText,
+        WorldInfoClockText,
     );
 
     let xp_block = commands
@@ -1800,11 +1880,7 @@ fn setup_help(commands: &mut Commands, hud: Entity, bindings: &InputBindings, th
         ),
         (
             "RMB".to_string(),
-            "Interact with objects/structures; hold to pick up drops".to_string(),
-        ),
-        (
-            key_label(bindings.place),
-            "Place selected placeable item/structure".to_string(),
+            "Place selected block/structure; interact; pick up drops".to_string(),
         ),
         (
             key_label(bindings.rotate_place),
@@ -1819,7 +1895,7 @@ fn setup_help(commands: &mut Commands, hud: Entity, bindings: &InputBindings, th
         ("Wheel".to_string(), "Cycle hotbar slots".to_string()),
         (
             key_label(bindings.map),
-            "Map reserved (not implemented)".to_string(),
+            "Open overhead map (Live/Explore)".to_string(),
         ),
         (key_label(bindings.pause), "Pause and settings".to_string()),
         (
@@ -3088,8 +3164,15 @@ fn spawn_backpack_perk_row(
 }
 
 fn track_fps(time: Res<Time>, mut counter: ResMut<FpsCounter>) {
+    let dt = time.delta_secs();
+    let ms = dt * 1000.0;
     counter.frames += 1;
-    counter.elapsed += time.delta_secs();
+    counter.elapsed += dt;
+    counter.recent.push(ms);
+    if counter.recent.len() > 240 {
+        let drain = counter.recent.len() - 240;
+        counter.recent.drain(0..drain);
+    }
 
     if counter.elapsed >= 0.25 {
         counter.fps = counter.frames as f32 / counter.elapsed;
@@ -3123,11 +3206,15 @@ fn log_perf_snapshot(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    let (max_ms, p95_ms, p99_ms) = counter.frame_stats();
     let line = format!(
-        "t={now} fps={:.1} frame_ms={:.2} view_distance={} loaded={} pending={} \
+        "t={now} fps={:.1} frame_ms={:.2} max_ms={:.2} p95_ms={:.2} p99_ms={:.2} view_distance={} loaded={} pending={} \
          triangles={} poll_ms={:.3} stream_ms={:.3} cull_ms={:.3}",
         counter.fps,
         counter.frame_ms,
+        max_ms,
+        p95_ms,
+        p99_ms,
         manager.view_distance,
         manager.loaded_chunks(),
         manager.pending_chunks(),
@@ -3308,12 +3395,16 @@ fn update_debug_text(
 fn update_level_panel(
     progression: Res<Progression>,
     biome: Res<BiomeInfo>,
+    cycle: Res<crate::day_night::DayNightCycle>,
+    icons: Res<UiIcons>,
     mut widgets: ParamSet<(
         Query<&mut Text, With<LevelText>>,
         Query<&mut Node, With<XpFill>>,
         Query<&mut Text, With<XpText>>,
         Query<&mut Text, With<WorldInfoBiomeText>>,
-        Query<&mut Text, With<WorldInfoTimeText>>,
+        Query<&mut Text, With<WorldInfoDayText>>,
+        Query<&mut Text, With<WorldInfoClockText>>,
+        Query<&mut ImageNode, With<WeatherIcon>>,
     )>,
 ) {
     for mut text in widgets.p0().iter_mut() {
@@ -3345,12 +3436,28 @@ fn update_level_panel(
             text.0.push_str(biome_label);
         }
     }
-    // Simple placeholder date until a real day/night/calendar system exists.
-    const DAY_LABEL: &str = "Day 1";
+
+    let day_label = cycle.day_label();
     for mut text in widgets.p4().iter_mut() {
-        if text.0.as_str() != DAY_LABEL {
-            text.0.clear();
-            text.0.push_str(DAY_LABEL);
+        if text.0 != day_label {
+            text.0 = day_label.clone();
+        }
+    }
+    let clock = cycle.clock_string();
+    for mut text in widgets.p5().iter_mut() {
+        if text.0 != clock {
+            text.0 = clock.clone();
+        }
+    }
+
+    let weather = if cycle.is_daytime() {
+        icons.hud(crate::ui::icons::HudIcon::WeatherDay)
+    } else {
+        icons.hud(crate::ui::icons::HudIcon::WeatherNight)
+    };
+    for mut image in widgets.p6().iter_mut() {
+        if image.image != weather {
+            image.image = weather.clone();
         }
     }
 }
@@ -3882,6 +3989,7 @@ fn on_slot_drag_end(
     slots: Query<(&SlotSource, Option<&Hovered>)>,
     camera: Query<&GlobalTransform, With<crate::player::PlayerCamera>>,
     visuals: Option<Res<crate::interaction::InteractionVisuals>>,
+    asset_server: Res<AssetServer>,
 ) {
     if drag.button != PointerButton::Primary {
         return;
@@ -3918,6 +4026,7 @@ fn on_slot_drag_end(
     crate::interaction::spawn_player_drop(
         &mut commands,
         visuals,
+        &asset_server,
         stack.item,
         stack.count,
         position,

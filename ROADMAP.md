@@ -44,41 +44,42 @@ work.
 
 ## 3. Map system
 
-The map is implemented with Live 3D and Explore 2D modes (see `FEATURES.md`). Remaining work:
+The map is implemented with Live and Explore modes, `M`/`Esc` open/close, `Tab`
+mode switching, pan/zoom/recenter, a player marker, binary fog of war and save-v2
+exploration records (see `FEATURES.md`). Remaining work:
 
-- **3D map:** an overhead live view of loaded chunks with a dedicated map
-  camera, player position/orientation, and optional zoom, rotation and camera
-  movement.
-- **2D map:** a persistent top-down view of explored areas with fog of war,
-  saved between sessions even after chunks unload.
-
-Open work:
-
-- Pressing M opens/closes the map and switches modes without losing position or
-  zoom where practical.
-- Keep exploration data independent of loaded chunk data and map rendering.
-- Choose three visibility states: unexplored, explored and currently visible.
-- Decide discovery radius and update rules.
+- Decide Live/Explore camera parity: whether Live stays fixed north-up overhead
+  or gains optional rotation/free camera movement, and how transitions preserve
+  position/zoom where practical.
 - Add dynamic map resolution/LOD with cached lower-resolution levels; zooming
   must never reveal unexplored terrain.
+- Decide whether the three tracked visibility states (unexplored, explored,
+  currently visible) should become three rendered states instead of the current
+  binary fog.
+- Confirm whether the current 48 m visible / 64 m discover radii are final and
+  how they scale with zoom.
 - Decide map visual style, biome labels, landmarks, player markers and routes.
-- Decide persistence format and save cadence for exploration data.
+- Decide persistence format and save cadence beyond the current save-v2 records.
 
 ## 4. Inventory, tools and progression
 
 - Decide the cost curve for backpack upgrades. The starting capacity (18) and
   maximum (40) are already set.
 - Load item, block and tool tables from data files instead of compiled tables.
-- Add crafting and recycling rules; item descriptions and `pieces_per_item`
-  metadata already anticipate this but no recipes exist.
+- Expand the ten shipped hand recipes and add recycling rules; item descriptions
+  and `pieces_per_item` metadata already anticipate this.
+- Add workbench-station recipes. The UI shell and category tabs exist, but no
+  station recipes ship.
+- Implement furnace smelting recipes/UI. The furnace structure and item exist,
+  but RMB interaction currently reports that smelting is unavailable.
 - Add tool quality tiers, crafting costs and tool-specific efficiency upgrades.
 - Add more off-hand utility trinkets beyond the shipped Lantern and Magnet.
   Lantern is a non-combat carried light source; do not add another light toggle
   or unrelated lighting work here.
 - Expand the shipped XP/coin/perk progression with farming, exploration rewards
   and long-term goals. No combat progression.
-- Expand the bottom-right biome card into a broader status readout with a game
-  date, day count and time of day.
+- Expand the top-left biome/time readout with richer calendar/weather status as
+  future systems land (biome, day count and time of day are already shown).
 
 ## 5. Building work
 
@@ -91,11 +92,12 @@ Open work:
 - Keep the current one-voxel placement, physical item cost, hammer shape menu
   and wrench rotation as the foundation for these features.
 
-## 7. Primitive fire system (future, after furnace)
+## 6. Primitive fire system (future, after smelting)
 
-This is roadmap direction only. Do **not** implement it as part of the current
-workbench/furnace work. After furnace, decide timing and break it into small
-verified increments.
+This is roadmap direction only. Do **not** implement it as part of furnace or
+workbench work. The furnace structure exists, but smelting is not implemented;
+after smelting lands, decide timing and break this into small verified
+increments.
 
 ### Primitive torch
 
@@ -133,7 +135,7 @@ verified increments.
 - Do not make fire mandatory for basic crafting progression.
 - Keep the initial fire system simple and data/system-reuse oriented.
 
-## 6. Open design decisions
+## 7. Open design decisions
 
 These remain undecided and should not be treated as requirements:
 
@@ -148,13 +150,21 @@ These remain undecided and should not be treated as requirements:
 - LOD thresholds and transition techniques.
 - Exact chunk streaming and processing budgets.
 - Map zoom levels, resolution tiers and hierarchical LOD structure.
-- Map discovery radius, exploration visibility and persistence rules.
-- 3D-map camera behavior and transitions between map modes.
+- Whether the current discovery radii and binary visibility are final, and how
+  exploration persistence should evolve.
+- Live/Explore camera behavior and transitions between map modes.
 - Map visual style, labels and points of interest.
+- Whether SSAO should be exposed in the Lighting tab or remain disabled; the UI
+  warning and the settings resolver currently disagree.
+- Whether Detailed light shafts should permanently force MSAA Off or support a
+  validated multisampled-depth path.
+- Depth-prepass validation coverage beyond the current shader permutations.
+- How to refresh Water Depth Tint's cached seabed heights after runtime edits.
 - Exact backpack upgrade costs.
 - Rules and stacking for additional off-hand trinkets beyond Lantern and
   Magnet.
 - Exact tool-quality tiers and crafting costs.
 - Building-piece rules beyond cube, half block, slope, stairs and panel.
 - Blueprint and snapping workflows.
-- Crafting, farming, exploration rewards and long-term progression.
+- Crafting expansion, recycling, furnace smelting, farming, exploration rewards
+  and long-term progression.

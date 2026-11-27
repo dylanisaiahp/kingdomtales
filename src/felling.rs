@@ -268,7 +268,6 @@ mod tests {
                 triangles: 0,
                 water_triangles: 0,
                 foliage_triangles: 0,
-                fade_remaining: 0.0,
             },
         );
         manager

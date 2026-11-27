@@ -7,14 +7,14 @@ lives in `ROADMAP.md` and should not be duplicated here.
 
 ## 0. Project state
 
-- Version: `0.0.2` in `Cargo.toml`.
-- Bevy `0.20.1`, features `3d` + `ui`.
-- Rust source: ~40k lines across `src/` (see `wc -l src/*.rs src/**/*.rs`).
-- Last verified baseline: `cargo fmt --all --check`,
+- Version: `0.0.3` in `Cargo.toml`.
+- Bevy `0.20.1`, features `3d`, `ui`, `ui_picking`, `png` and `bevy_gltf`.
+- Rust source: ~45k lines across `src/` (see `wc -l src/*.rs src/**/*.rs`).
+- Last verified baseline (2026-11-26): `cargo fmt --all --check`,
   `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`,
-  `cargo test --all-targets` (**329 passed, 0 failed, 4 ignored**), and
-  `cargo build`. No in-game/runtime smoke verification was performed in this
-  pass.
+  `cargo test --all-targets` (**351 passed, 0 failed, 4 ignored**),
+  `cargo run --bin shader_check` (10 shader permutations), and `cargo build`.
+  No in-game/runtime smoke verification was performed in this pass.
 
 ## 1. Game identity and settled decisions
 
@@ -37,9 +37,10 @@ These decisions are settled and should not be reintroduced:
    is metadata plus mining rules. `Toolbelt` is gone.
 6. **No tool wheel.** There is no `src/ui/radial.rs`, `Overlay::ToolRadial` or
    hold-Q tool selector.
-7. **Backpack is storage/UI only.** No follower, legs, movement, weight,
-   sinking or equipment attachments. The Magnet and Lantern are real off-hand
-   trinkets, not backpack attachments. Keep slots, categories, details and
+7. **Backpack is storage/UI only.** No follower, legs, movement, weight or
+   sinking. The character panel has four attachment slots: slot 0 is the
+   off-hand and slots 1-3 are backpack attachment slots; Lantern and Magnet
+   activate in any of them. Keep slots, categories, details and
    capacity/category upgrades.
 8. **Hotbar has eight slots.** One stack per slot; stack limits come from item
    metadata.
@@ -61,11 +62,11 @@ These decisions are settled and should not be reintroduced:
     plus one perk point. Perk points buy larger scaling bonuses in level bands.
 16. **Economy and notification values are data-driven.** Pickup XP/coins live in
     `PICKUP_REWARDS`; transient HUD rows come from `NotificationFeed`.
-17. **The map has live 3D and Explore 2D modes.** `M` toggles the map overlay,
-    which renders a north-up 3D live view or a 2D Explore view with pan/zoom,
-    recenter, player marker, fog-of-war visibility, and persisted explored cells.
-    Exploration accumulates while the map is closed; Explore rendering/snapshot
-    work is gated to the map being open.
+17. **The map has Live and Explore modes.** `M` toggles the map overlay, which
+    renders a north-up 3D Live view or a 2D Explore view with pan/zoom, recenter,
+    player marker, fog-of-war visibility, and persisted explored cells. `Tab`
+    switches modes while the map is open. Exploration accumulates while the map
+    is closed; Explore rendering/snapshot work is gated to the map being open.
 18. **LODs are deliberately last.** Occlusion culling remains unimplemented;
     performance work so far is exposed-face culling, frustum culling, stream
     priority and foliage shadow handling.
@@ -294,21 +295,57 @@ These decisions are settled and should not be reintroduced:
   the normal band, so changing pitch while looking into a cave does not move it;
   chunks are fully fogged before the cull distance. Bevy frustum-culls each chunk
   mesh.
-- The first-person camera carries a procedurally generated cubemap sky with six
-  256x256 faces, a blue horizon, deeper zenith, dark ground half and a soft round
-  sun disc. It is generated in memory, so there are no external sky assets, and
-  its brightness compensates for Bevy's HDR skybox exposure. The skybox is not
-  fogged, which keeps cave openings visibly bright while underground fog stays
-  dark inside the cave.
+- The first-person camera carries a shader-driven procedural sky: a
+  camera-attached background cube with a custom WGSL material in
+  `assets/shaders/sky.wesl`. Colors are computed per fragment from
+  `DayNightCycle` uniforms, with day/twilight/night palettes, square shaded
+  sun/moon discs, soft halos, and stable hashed stars above the horizon. There
+  is no CPU cubemap generation or periodic face regeneration. The sky is not
+  fogged, preserving bright cave openings while underground fog darkens enclosed
+  spaces.
+- A unified `DayNightCycle` resource drives time of day, sun/moon direction,
+  surface ambient/sun/moon lighting, fog/clear color, and HUD day/time display.
+  Time convention: 0.00 midnight, 0.25 sunrise (east), 0.50 noon, 0.75 sunset
+  (west). Moon shadows are disabled; sun shadows remain the primary shadow caster.
+- Clouds are voxel-style formations: connected 1 m voxel cells generated on a
+  coarse 3D grid and greedily merged into meshes rendered by
+  `assets/shaders/cloud.wesl`. They sit in a camera-centered world-space grid,
+  follow the camera, use alpha-to-coverage with day/night/twilight tinting, cast
+  no shadows, and are excluded from prepasses. There is no scrolling noise plane,
+  raymarching or cloud shadow pass. The Graphics tab's `Clouds` toggle disables
+  them for performance comparison.
 - Underground state combines the camera's depth below the local 1 m surface with
   upward terrain raycasts. A visible opening to the sky keeps the daylight
-  presets, so jumping into a cave mouth does not snap to dark. Fully enclosed
-  space fades over about a second into dim ambient light and a 60 m fog end;
-  returning to an opening restores daylight. No extra collision geometry or
-  material flag is needed.
+  presets from snapping; fully enclosed space blends toward cave ambient/fog
+  presets. Existing cave-mouth behavior is preserved.
+- Runtime assets are checked in under `assets/` and loaded directly by Bevy:
+  hand-authored WESL shaders in `assets/shaders/`, UI PNG icons in
+  `assets/ui/icons/`, item and drop models in `assets/models/items/`,
+  and `assets/textures/water_detail.png`. The PNGs in
+  `assets/textures/items/` are retained source art that was embedded into the
+  GLBs. The original Python generation scripts have been removed; no
+  generation tooling is included. Generated runtime assets and source art must
+  remain in the repository because they are not recreated at startup.
+- Light shafts are controlled in Settings → Lighting → `Light shafts`, with
+  values `Off`, `Simple` and `Detailed`; `Simple` is the default. `Simple` is a
+  screen-space sun-shaft pass with no depth prepass. `Detailed` uses
+  depth-prepass occlusion, adds `DepthPrepass` and currently forces MSAA Off,
+  restoring the preferred sample count when disabled. Both modes use the shared
+  underground/sky signal: shafts require open sky, fade with the cave blend, and
+  disappear in fully enclosed caves or structures while lit cave mouths keep
+  daylight behavior. Water, clouds and transparent chunk fades do not write
+  prepass depth, so they may not block Detailed shafts. The final Detailed/MSAA
+  policy is still open (see `ROADMAP.md` and `ISSUES.md`).
 - Water renders in its own translucent mesh. Upward water faces are recessed by
   0.1 m so the surface sits just below the voxel's top edge; side faces stay full
-  height to keep the shoreline closed.
+  height so water columns remain closed. **Water Depth Tint** uses a dedicated
+  per-vertex depth attribute on every face of the column, computed from the
+  generation-time cached seabed height of that world column, so the whole column
+  darkens progressively and becomes nearly opaque instead of only tinting the
+  surface. A smoothed fullscreen blue tint fades in whenever the camera eye is
+  inside a water voxel. Limitation: runtime seabed edits do not refresh the
+  cached height, so tint can remain stale until that cache is rebuilt (see
+  `ISSUES.md`).
 - Natural foliage is meshed into a separate child entity marked `NotShadowCaster`.
   It uses an opaque PBR material extended with a time-driven vertex wind-sway
   shader so leaves sway from their base while remaining visible in the main pass
@@ -318,17 +355,14 @@ These decisions are settled and should not be reintroduced:
   the downward cave tail, rather than assuming the normal band is always active.
   At the default view distance of 8, the normal band is 1,379 chunks (~119 MB);
   the tail adds 493 chunks (~42 MB), for a worst case of 1,872 chunks (~161 MB).
-- Current release microbaselines from ignored tests: generation
-  (`world::generation::tests::bench_generate_chunk`) produces 1,211 non-air
-  world voxels in about 459 us per chunk; meshing
-  (`world::mesher::tests::bench_generated_chunk`) produces 1,020 opaque plus
-  11,976 foliage triangles in about 2.06 ms per chunk. The mesh breakdown test
-  confirms that terrain-only geometry is about 648 triangles and 1.2 ms, with
-  nearly all remaining geometry coming from foliage. Foliage is a separate
-  `NotShadowCaster` mesh, so it does not add shadow-pass cost. In a local
-  windowed smoke run at view distance 24, this raised steady frame rate from
-  roughly 100 FPS to roughly 320 FPS at about 12.5k chunks and 13.7M rendered
-  triangles. These are Step 2 measurements, not final budgets.
+- Ignored release benchmarks (2026-11-26) report generation
+  (`world::generation::tests::bench_generate_chunk`) at 1,211 non-air world
+  voxels in about 263 us per chunk, and meshing
+  (`world::mesher::tests::bench_generated_chunk`) at 1,640 opaque plus 3,220
+  foliage triangles in about 1.06 ms per chunk. The mesh breakdown test reports
+  about 596 terrain-only triangles in about 0.79 ms. Foliage is a separate
+  `NotShadowCaster` mesh, so it does not add shadow-pass cost. These are
+  synthetic ignored-test measurements, not final budgets or in-game FPS.
 - The F3 overlay shows rolling wall-clock timings for the world poll, stream and
   cull systems alongside FPS, loaded/pending chunks and triangle count. These
   are CPU-side timings on the system thread, not GPU timings.
@@ -341,24 +375,31 @@ These decisions are settled and should not be reintroduced:
   distance. Low uses one cascade, 70 m, 1024x1024 maps and cheap 2x2 filtering;
   Medium uses two cascades, 110 m, 1024x1024 maps and Gaussian filtering; High
   restores three cascades, 140 m, 2048x2048 maps and Gaussian filtering. The sun
-  keeps its fixed direction and colour in every preset. The player camera uses
-  2x MSAA instead of 4x to reduce fill cost on dense voxel silhouettes.
+  keeps its fixed direction and colour in every preset. The preferred player
+  camera sample count is 2x MSAA instead of 4x to reduce fill cost on dense
+  voxel silhouettes; the render-requirements system switches to MSAA Off while
+  Detailed light shafts or a non-Off SSAO setting is active and restores the
+  preferred count afterwards.
 
 ## 3. Map system
 
-Press `M` to toggle the map overlay (`Overlay::Map`). The map has two modes:
+Press `M` to toggle the map overlay (`Overlay::Map`). The map has two modes,
+switchable with `Tab` or the top-centre mode tabs:
 
-- **Live 3D:** north-up overhead view rendered by a dedicated `MapCamera` into an
+- **Live:** north-up 3D overhead view rendered by a dedicated `MapCamera` into an
   offscreen texture shown in the map UI. It uses loaded world/chunk rendering and
   focuses on the player's current world position/height when opened or recentered.
-- **Explore 2D:** CPU-composited north-up top-down image of explored terrain,
-  with pan, zoom, recenter (`C`/`Home`), player marker/facing, and mode tabs.
+- **Explore:** CPU-composited north-up 2D top-down image of explored terrain,
+  with a player marker/facing and cached terrain/flora snapshots.
 
-Fog-of-war in Explore is binary: unexplored cells are transparent/hidden;
-explored cells show terrain. Exploration is tracked in 4 m grid cells, updated
-from player position (discover/visible radii), accumulated while the map is
-closed, and persisted in save v2 `map_explored x z` records. Save validation
-rejects invalid map exploration data before mutating live state.
+Drag pans, scroll zooms, and `C`/`Home` recenters in either mode; `M` or `Esc`
+closes the map. Fog-of-war in the rendered Explore image is binary: unexplored
+cells are transparent/hidden and explored cells show terrain. Currently visible
+cells are tracked separately, but no three-state display is shipped. Exploration
+is tracked in 4 m grid cells, updated from player position (48 m visible and
+64 m discover radii), accumulated while the map is closed, and persisted in save
+v2 `map_explored x z` records. Save validation rejects invalid map exploration
+data before mutating live state.
 
 Explore snapshots use budgeted chunk builds, terrain/flora cache entries keyed
 by chunk, and dirty invalidation hints from world edits. Snapshot/render/build
@@ -379,12 +420,14 @@ work is gated to the map being open.
 - Holding LMB with a mining tool shows a mining preview. Releasing early
   restores the original material, shape and orientation; breaking completes the
   action and spawns drops.
-- Blocks require the correct tool: an axe for wood/leaves, a shovel for
-  soil/sand/snow, a pickaxe for stone including red sandstone, and a hoe as an
-  alternative for turf, topsoil and humus. An empty hand cannot harvest
-  blocks, and changing tools cancels the swing. Bedrock and water cannot be
-  mined. No tools are granted automatically;
-  use `/give` to obtain them.
+- Blocks require the correct tool: an axe or stone hand axe for wood/leaves, a
+  shovel for soil/sand/snow, a pickaxe for stone including red sandstone, and a
+  hoe as an alternative for turf, topsoil and humus. A stone tipped stick can
+  cut loose foliage. The bark scraper strips bark from trunks/stems without
+  felling them, and the small stone hammer breaks natural stone deposits rather
+  than ordinary terrain. An empty hand cannot harvest blocks, and changing tools
+  cancels the swing. Bedrock and water cannot be mined. No tools are granted
+  automatically; craft primitive tools by hand or use `/give`.
 - Mining a 1 m world voxel clears its eight detail cells and removes any natural
   turf or snow flag, rewarding one physical resource item. Mining a 0.5 m detail
   voxel rewards one matching item.
@@ -422,18 +465,21 @@ work is gated to the map being open.
   8 px radius.
 - Hotbar and backpack slots use the same 58 px tile and item presentation. The
   off-hand slot stays reserved and blank until a trinket is equipped, and it
-  shows only the generated item icon and count with no name or description text.
+  shows only the item icon and count with no name or description text.
   Empty slots contain only the tile; occupied slots show a distinct unframed
-  procedural icon centered in the tile and a count when the stack has more than
-  one item. Pebble icons use the pebble's real item color. Dragging from one slot to
+  item icon centered in the tile and a count when the stack has more than
+  one item. Item icons are mapped PNG assets in `ui/icons/items/`, with
+  procedural fallbacks in `src/ui/icons.rs` for items without a PNG. Pebble icons
+  use the pebble's real item color. Dragging from one slot to
   another swaps stacks while the Tab overlay is open, and the click emitted at
   the end of a drag is ignored by the details panel.
 - Backpack capacity upgrades add general slots up to a maximum. Category
   upgrades unlock colored sections; items enter matching sections automatically
   and existing items are reorganized when a section unlocks.
 - Chat commands include `/help`, `/give <item> [count]`, `/clear`,
-  `/upgrade capacity`, `/unlock <category>`, `/fly`, `/noclip`, `/tp`,
-  `/spawn`, `/seed` and `/pos`.
+  `/upgrade capacity`, `/unlock <category>`, `/fly`, `/noclip`, `/tp <x> <y> <z>`,
+  `/spawn`, `/seed`, `/pos`, and `/time set|add|query|speed|cycle`. `/give` with
+  no arguments opens the item picker.
 - `/tp` and `/spawn` synchronously load the destination's local chunk patch and
   clear all motion state before the next movement tick. Chunk streaming takes
   its center from the player's `Transform` rather than the camera's stale
@@ -471,36 +517,46 @@ work is gated to the map being open.
   overlapping. It only appears while gameplay has the cursor captured and no
   overlay is open.
 - `BiomeInfo` is sampled from the world generator at the player's position in
-  metres and drives a compact bottom-right card showing `Biome: <name>` for the
-  five current cell biomes: Plains, Forest, Desert, Mesa and Alpine.
+  metres. It shares the top-left info block with the `Day N` counter and clock,
+  showing `Biome: <name>` for the five current cell biomes: Plains, Forest,
+  Desert, Mesa and Alpine. A 32x32 sun or crescent-moon PNG from
+  `ui/icons/hud/` sits beside the time readout.
 
-### Placeable structures (verified in-game by user)
+### Placeable structures
 
 - A save-compatible placeable-structure foundation exists for anchored
   multi-cell structures. Structure save records are optional in v2 saves;
   old saves without structure records remain loadable, and invalid structure
   records are rejected before mutating live world/player state.
-- **Workbench**: placeable primitive wooden table, approximately 2m wide x 1m
+- **Workbench**: placeable primitive wooden table, approximately 2 m wide x 1 m
   deep, with four legs, tabletop, supporting braces, and visible open space
   underneath (not a solid block). It occupies a 2-cell anchored footprint;
   both cells behave as one structure for placement, collision, selection,
   interaction, dismantling, and persistence.
-- Placement uses the placeable preview/validity flow and aligns to the 1m grid
-  with center-origin/footprint parity handling. RMB interacts with the placed
-  workbench; LMB uses the selected tool.
-- Dismantling requires an axe (existing axe tool-kind/category), uses timed
-  mining animation, and shrinks/refunds/removes the structure as one piece.
-  Ordinary hand/unrelated tools do not dismantle it.
+- **Furnace**: placeable primitive stone furnace, approximately 2 m wide x 1 m
+  deep x 3 m tall, with the same anchored structure pipeline. It uses a 2-cell
+  footprint, has collision, and can be dismantled with a pickaxe or small stone
+  hammer. RMB interaction currently reports `Smelting is not available yet.`;
+  no smelting UI or recipes ship.
+- Placement uses the placeable preview/validity flow and aligns to the 1 m grid
+  with center-origin/footprint parity handling. `R` rotates the preview; RMB
+  places or interacts, and LMB uses the selected tool.
+- Dismantling uses timed mining and shrinks/refunds/removes the structure as one
+  piece. Workbenches require an axe (including the stone hand axe); furnaces
+  require a pickaxe or small stone hammer. Ordinary hand/unrelated tools do not
+  dismantle structures.
 - Interacting with the workbench opens a dedicated workbench UI shell above or
   alongside the backpack while the backpack remains accessible. The workbench
   UI shows `WORKBENCH`, category tabs (`Components`, `Equipment`,
   `Construction`, `Stations`), and a proper empty state when no workbench
-  recipes are available. No placeholder workbench recipes were added; existing
-  recipes remain hand-crafted for now.
+  recipes are available. All shipped recipes are hand recipes; no
+  workbench-station recipes are implemented.
 
 The HUD layout is fixed and shared through `src/ui/theme.rs`:
 
-- top left: level and XP bar, with unspent perk points
+- top left: level and XP bar with unspent perk points, plus a biome/time block
+  with an external sun or crescent-moon PNG icon beside the day counter and
+  in-game clock
 - top centre: clipped compass strip with static N/E/S/W labels that slide under
   a fixed centre mark as the player turns. Each cardinal glyph is center-aligned
   in its band so the mark lines up with the letter; no caps and no bearing number
@@ -518,8 +574,8 @@ The HUD layout is fixed and shared through `src/ui/theme.rs`:
   The hotbar has a reserved blank off-hand slot and eight pockets that show an
   item only when one is carried
 - bottom left: key hints; the chat panel sits just above them
-- bottom right: a small current-biome card in the corner, with stacked
-  pickup/status notifications immediately above it
+- bottom right: stacked pickup/status notifications; the current biome and time
+  readout is in the top-left info block
 
 All UI text is ASCII-only. Every surface reads from the single `UiTheme`
 resource installed by `UiPlugin`: HUD cards, the level/XP panel, compass, coins,
@@ -535,34 +591,58 @@ empty. Storage and hotbar slots are visually identical and show distinct item
 art instead of letters; the storage panel docks flush to the hotbar with square
 joining corners, and drag/inspection targets are highlighted. The survival row
 uses three equal flex readouts instead of fixed-width bars, so it always spans
-from one 8 px inset to the other. There is no light orb or on/off status. Item
-and status icons are 12x12 pixel patterns generated in `src/ui/icons.rs` as
-nearest-filtered RGBA textures and drawn with `ImageNode`; no external art
-assets are loaded. The settings screen is a fixed full-window translucent panel,
-so changing tabs never resizes the menu.
+from one 8 px inset to the other. There is no light orb or on/off status.
+Icon assets are checked in, not generated at startup: item icons are 32x32
+PNGs in `ui/icons/items/`, weather icons are 32x32 PNGs in `ui/icons/hud/`,
+and the remaining HUD symbols and notification tones use 12x12 procedural
+patterns from `src/ui/icons.rs`. All are nearest-filtered. The settings screen
+is a fixed full-window translucent panel, so changing tabs never resizes the
+menu.
 
 ## 7. Tools, building and off-hand
+
+### Crafting
+
+- Crafting is data-driven (`RecipeId` / `RECIPES` in `src/crafting/mod.rs`) and
+  has no 2x2/3x3 grid. Recipes declare ingredients, required context/tools,
+  descriptive steps and outputs; validation reports missing reasons and execution
+  is atomic.
+- All ten shipped recipes are hand recipes available from the Tab overlay:
+  sharpen a granite/slate/sandstone/limestone pebble into a Sharpened Stone;
+  Stick + Sharpened Stone → Stone Tipped Stick; 2 Fiber → Cordage;
+  Stick + Sharpened Stone + Cordage → Stone Hand Axe;
+  Stick + Sharpened Stone → Bark Scraper;
+  Stick + Granite Pebble + Cordage → Small Stone Hammer; and
+  4 Wood + 2 Cordage → Workbench.
+- Natural-surface and station contexts are scaffolded but unused by shipped
+  recipes. The workbench UI shell and category tabs are live, but no
+  workbench-station recipes ship, so its category views show the empty state.
+- Recycling rules and furnace smelting recipes are not implemented.
 
 ### Tools
 
 - Tools are ordinary hotbar items with stack limit 1: Pickaxe, Axe, Hammer,
-  Shovel, Hoe, Scythe and Wrench.
+  Shovel, Hoe, Scythe, Wrench, Stone Hand Axe, Bark Scraper and Small Stone
+  Hammer. The Stone Tipped Stick is a primitive non-`ToolKind` hand item.
 - The selected stack decides the LMB action. There is no separate tool
   inventory and no tool wheel.
 - Mining roles live in `ToolKind` / `TOOL_DEFS`: pickaxe for stone and ore
-  (including red sandstone), axe for wood and leaves, shovel for soil, sand and
-  snow, hoe for turf, topsoil and humus, scythe for leaves, and hammer/wrench for
-  non-mining work. `required_tools()`
-  is the inverse table used by Insight hints, with a test keeping it aligned
-  with the mining roles.
+  (including red sandstone), axe or stone hand axe for wood and leaves, shovel
+  for soil, sand and snow, hoe for turf, topsoil and humus, scythe for leaves,
+  and hammer/wrench for non-mining work. The stone hand axe is slower than a
+  proper axe. Bark scraping and small-stone-hammer stone-deposit breaking are
+  specialized interactions rather than general mining roles. `required_tools()`
+  is the inverse mining table used by Insight hints, with a test keeping it
+  aligned with the mining roles.
 - This is adventure-style tool use: selecting the wrong tool, or nothing, does
   not break a block. Loose sticks and pebbles are RMB pickups rather than block
   harvesting and remain hand-gatherable.
 
 ### Building
 
-- Selecting a block item and LMB-clicking places one full cube against the hit
-  face, oriented toward the player.
+- Selecting a block item and RMB-clicking places one full cube against the hit
+  face, oriented toward the player. Interactable structures still open on RMB
+  when the held item is not placeable, matching Minecraft.
 - Placement consumes one matching item from the selected pocket, then the
   backpack. Occupied cells, cells overlapping the player and unloaded chunks
   reject placement without spending anything.
@@ -602,7 +682,10 @@ so changing tabs never resizes the menu.
 
 ### Item drops
 
-- Drops use item-specific cuboid silhouettes/colors: sticks, leaves, tools, fiber/cordage, pebbles, and lantern/magnet have distinct sizes/colors. They are not multi-part 3D drop models.
+- Drops use item-specific GLB models from `assets/models/items/` for tools,
+  primitive items, pebbles, workbench/furnace and trinkets. Items without a
+  model (including block items) use item-specific cuboid silhouettes/colors as
+  a fallback.
 - Drops fall under gravity, snap to the surface on support and settle. Settled
   drops do not bob or spin.
 - Support is rechecked on a timer. If the supporting voxel is removed, the drop
@@ -655,15 +738,21 @@ so changing tabs never resizes the menu.
   are accepted and ignored. The save header stays `KT_SAVE 2`; the off-hand slot
   itself is runtime state and is not saved.
 - Esc opens a vertical pause menu with Resume, Settings and Quit. Choosing
-  Settings opens a separate tabbed screen with centered Video, Audio, Mouse,
-  Controls and Map tabs. Audio and Map are placeholder UI only; perks are no
-  longer shown in settings. Esc on the Settings screen returns to the pause
-  menu.
-- Video holds field of view (90-120 degrees), view distance (4-128 chunks, with
-  a RAM hint), shadow quality, VSync, fullscreen and the off-by-default perf log
-  toggle. Mouse holds mouse sensitivity. Controls lists the current bindings.
-  Character level/XP/coins/perk points and `+` buttons live in the
-  backpack panel, not in settings.
+  Settings opens a full-screen tabbed menu with a left sidebar and six
+  categories: Graphics, Lighting, Color, Mouse, Keybinds and Audio. Esc on the
+  Settings screen returns to the pause menu.
+- Graphics holds field of view (90-120 degrees), view distance (4-128 chunks,
+  with a RAM hint), VSync, fullscreen, the off-by-default perf log toggle,
+  `Clouds` and `Wind strength`. Lighting holds `Shadow quality`, an `SSAO` row
+  whose note says it is unavailable due an unresolved rendering regression,
+  `Light shafts` (`Off` / `Simple` / `Detailed`, default `Simple`), and `Bloom`.
+  Color holds tonemapping and color grading. Mouse holds sensitivity. Keybinds
+  lets gameplay keys be reassigned; taking an already-used key swaps the two
+  actions, and Esc cancels capture. Mouse buttons and hotbar slots are not
+  rebindable yet, and rebindings currently last for the session. Audio is a
+  placeholder. Character level/XP/coins/perk points and `+` buttons live in the
+  backpack panel, not in settings. The SSAO UI/rendering mismatch is tracked in
+  `ISSUES.md`.
 - All settings apply immediately. Shadow quality cycles Off / Low / Medium /
   High; the default Medium uses two sun cascades out to 110 m, while High
   restores the original three cascades out to 140 m. Fullscreen uses borderless
@@ -677,7 +766,8 @@ so changing tabs never resizes the menu.
 
 ## 10. Controls
 
-Implemented defaults (gameplay keys live in `InputBindings`):
+Implemented defaults (gameplay keys live in `InputBindings` and can be changed
+in Settings → Keybinds):
 
 - **WASD:** Move.
 - **Space (hold):** Jump. Jumping does not consume stamina. This also jumps out
@@ -688,10 +778,12 @@ Implemented defaults (gameplay keys live in `InputBindings`):
 - **Ctrl:** Crouch. With `/fly` active, Ctrl descends and Space ascends.
 - **1-8:** Select a hotbar slot.
 - **Mouse wheel:** Cycle hotbar slots.
-- **Left click:** Mine with a tool, place a block from inventory, apply the
-  hammer shape, or rotate with the wrench.
-- **Right click:** Gather loose pebbles and ground sticks, pick up drops
-  continuously, or hold with the hammer to open the shape menu.
+- **Left click:** Mine with a tool, apply the hammer shape, or rotate with the
+  wrench.
+- **Right click:** Place the selected block or structure, interact with objects
+  and structures, gather loose pebbles and ground sticks, pick up drops
+  continuously, or hold with the hammer to open the shape menu. F is no longer a
+  placement key.
 - **F9:** Save the world and inventories.
 - **F10:** Load the save file.
 - **F12:** Save a timestamped PNG of the current frame into `screenshots/`.
@@ -699,7 +791,9 @@ Implemented defaults (gameplay keys live in `InputBindings`):
   backpack with a stretched hunger/Insight/thirst row at its base and the hotbar
   in the centre, click-to-inspect details immediately right. Drag stacks between
   slots while it is open.
-- **M:** Reserved for the future map; it currently has no game effect.
+- **M:** Open or close the map. While it is open, drag/scroll pan and zoom,
+  `C`/`Home` recenters, `Tab` switches Live/Explore, and `M`/`Esc` closes it.
+  `Esc` closes any overlay before it opens the pause menu.
 - **Enter:** Open chat; Enter again sends without closing. Esc closes. The chat
   panel is 424 px wide.
 - **`/fly`:** Toggle flight; WASD is camera-relative (W follows view pitch),
@@ -751,9 +845,17 @@ Implemented defaults (gameplay keys live in `InputBindings`):
 - `Progression` is authoritative for level/XP/coins/perks and survival bars. Do
   not add a second copy in the UI, add health/injury, or make empty bars damage
   or block the player.
-- The map binding and `Overlay::Map` are display placeholders only. Do not add a
-  map screen, discovery save records or M-key handling as part of unrelated UI
-  work.
+- The map is implemented; `bindings.map` and `Overlay::Map` are not placeholders.
+  Explore rendering/snapshot work is gated to the map being open, while
+  exploration accumulation is not.
+- Water Depth Tint reads generation-time cached world-column seabed heights.
+  Runtime seabed edits do not refresh that cache, so tint can stay stale until
+  the cache is rebuilt.
+- `cargo run --bin shader_check` validates WESL/Naga permutations only (10
+  currently); it cannot verify visual output or in-game rendering state.
+- The Lighting SSAO row and note disagree with the settings resolver, which
+  wires SSAO components when the mode is non-Off. Check `ISSUES.md` before
+  changing SSAO behavior.
 - `Overlay::ShapeMenu` is a vertical presentation panel, not a radial tool menu.
   There is no toolbelt, no hold-Q switching and no active-tool HUD element.
 - Perf logging writes `/tmp/opencode/kt-perf.log` only when the settings toggle
@@ -773,10 +875,13 @@ Run these before calling a change complete:
 cargo fmt --all --check
 cargo check --all-targets
 cargo clippy --all-targets -- -D warnings
-cargo test
+cargo test --all-targets
+cargo run --bin shader_check
 cargo build
 timeout 8 ./target/debug/KingdomTales
 ```
 
-The smoke run should create a window without a panic; timeout exit code 124 is
-expected.
+`cargo run --bin shader_check` validates all WESL shader permutations with WGSL
+parsing and Naga validation (10 permutations at last check). It does not verify
+visual correctness. The smoke run should create a window without a panic;
+timeout exit code 124 is expected.

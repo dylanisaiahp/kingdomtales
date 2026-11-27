@@ -60,11 +60,6 @@ pub struct Structures {
 }
 
 impl Structures {
-    #[allow(dead_code)]
-    pub fn get_at(&self, cell: IVec3) -> Option<&PlacedStructure> {
-        let id = self.by_cell.get(&cell).copied()?;
-        self.placed.get(&id)
-    }
     pub fn occupied_cells(kind: StructureKind, anchor: IVec3, facing: Facing) -> Vec<IVec3> {
         let (w, d) = kind.footprint();
         let mut cells = Vec::with_capacity((w * d) as usize);
@@ -157,11 +152,6 @@ impl Structures {
             }
         }
         Some(placed)
-    }
-    #[allow(dead_code)]
-    pub fn remove_at(&mut self, cell: IVec3) -> Option<PlacedStructure> {
-        let id = *self.by_cell.get(&cell)?;
-        self.remove(id)
     }
     pub fn iter(&self) -> impl Iterator<Item = &PlacedStructure> {
         self.placed.values()

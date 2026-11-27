@@ -249,6 +249,9 @@ pub struct ChunkData {
     pub coord: IVec3,
     pub blocks: Vec<Voxel>,
     pub world_blocks: Vec<Block>,
+    /// Top solid world-voxel Y for each padded world column. Cached at
+    /// generation time so seabed depth never depends on chunk-local padding.
+    pub world_heights: Vec<i32>,
     pub world_turf: Vec<bool>,
     pub world_snow: Vec<bool>,
 }
@@ -259,6 +262,7 @@ impl ChunkData {
             coord,
             blocks: vec![Voxel::AIR; PADDED_VOLUME],
             world_blocks: vec![Block::Air; WORLD_PADDED_VOLUME],
+            world_heights: vec![0; WORLD_PADDED_X * WORLD_PADDED_Z],
             world_turf: vec![false; WORLD_PADDED_VOLUME],
             world_snow: vec![false; WORLD_PADDED_VOLUME],
         }
@@ -270,6 +274,18 @@ impl ChunkData {
             return Voxel::AIR;
         }
         self.blocks[padded_index(px, py, pz)]
+    }
+
+    /// Cached seabed height for a chunk-local world column. Padding columns are
+    /// valid, so corners shared by neighbouring chunks agree exactly.
+    #[inline]
+    pub fn world_height_local(&self, x: i32, z: i32) -> i32 {
+        let px = x + WORLD_PAD as i32;
+        let pz = z + WORLD_PAD as i32;
+        if px < 0 || pz < 0 || px >= WORLD_PADDED_X as i32 || pz >= WORLD_PADDED_Z as i32 {
+            return 0;
+        }
+        self.world_heights[pz as usize * WORLD_PADDED_X + px as usize]
     }
 
     #[inline]
@@ -601,9 +617,6 @@ pub struct Chunk {
     pub triangles: usize,
     pub foliage_triangles: usize,
     pub water_triangles: usize,
-    /// Time remaining for visual fade-in. 0 means fully visible.
-    #[allow(dead_code)]
-    pub fade_remaining: f32,
 }
 
 #[cfg(test)]
